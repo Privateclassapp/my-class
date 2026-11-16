@@ -1,0 +1,33 @@
+{
+  "name": "کلاس من — مدیریت شاگردان",
+  "short_name": "کلاس من",
+  "description": "مدیریت شاگردان، حضور و غیاب، نمرات و پرداخت‌ها، با همگام‌سازی اختیاری Google Drive.",
+  "lang": "fa",
+  "dir": "rtl",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "portrait-primary",
+  "background_color": "#0f766e",
+  "theme_color": "#0f766e",
+  "categories": ["education", "productivity"],
+  "icons": [
+    { "src": "icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+    { "src": "icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },
+    { "src": "icon-maskable-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+  ],
+  "shortcuts": [
+    {
+      "name": "حضور و غیاب",
+      "short_name": "حضور",
+      "url": "./index.html#/attendance",
+      "icons": [{ "src": "icon-192.png", "sizes": "192x192" }]
+    },
+    {
+      "name": "شاگردان",
+      "short_name": "شاگردان",
+      "url": "./index.html#/students",
+      "icons": [{ "src": "icon-192.png", "sizes": "192x192" }]
+    }
+  ]
+}

@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="fa" dir="rtl">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="color-scheme" content="light dark">
+  <meta name="theme-color" content="#0f766e">
+  <meta name="description" content="کلاس من — مدیریت شاگردان، حضور و غیاب، نمرات و پرداخت‌ها، با همگام‌سازی اختیاری Google Drive و پرونده شاگرد.">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="default">
+  <meta name="apple-mobile-web-app-title" content="کلاس من">
+  <title>کلاس من — مدیریت شاگردان</title>
+  <link rel="manifest" href="manifest.json">
+  <link rel="icon" type="image/png" sizes="192x192" href="icon-192.png">
+  <link rel="apple-touch-icon" href="apple-touch-icon.png">
+  <link rel="preload" href="Vazirmatn-Variable.woff2" as="font" type="font/woff2" crossorigin>
+  <link rel="stylesheet" href="styles.css">
+  <script defer src="jalaali-vendor.js"></script>
+  <script defer src="jalali.js"></script>
+  <script defer src="i18n.js"></script>
+  <script defer src="format.js"></script>
+  <script defer src="crypto.js"></script>
+  <script defer src="db.js"></script>
+  <script defer src="billing.js"></script>
+  <script defer src="config.js"></script>
+  <script defer src="drive.js"></script>
+  <script defer src="portal.js"></script>
+  <script defer src="sync.js"></script>
+  <script defer src="ui.js"></script>
+  <script defer src="pages-students.js"></script>
+  <script defer src="pages-classes.js"></script>
+  <script defer src="pages-attendance.js"></script>
+  <script defer src="pages-money.js"></script>
+  <script defer src="app.js"></script>
+</head>
+<body>
+  <div id="gate" class="gate" aria-live="polite"></div>
+
+  <div id="app" class="app-shell" hidden>
+    <header id="appHeader" class="app-header"></header>
+    <main id="view" class="view" tabindex="-1"></main>
+    <nav id="bottomNav" class="bottom-nav" aria-label="منوی اصلی"></nav>
+  </div>
+
+  <div id="netBanner" class="net-banner" hidden></div>
+  <div id="modalRoot"></div>
+  <div id="toastRoot" class="toast-root" aria-live="polite" aria-atomic="true"></div>
+
+  <noscript>
+    <div class="noscript">برای استفاده از این برنامه، JavaScript مرورگر را روشن کنید.</div>
+  </noscript>
+</body>
+</html>
