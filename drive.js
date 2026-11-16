@@ -5,7 +5,7 @@
   var UPLOAD = 'https://www.googleapis.com/upload/drive/v3';
   var GIS_URL = 'https://accounts.google.com/gsi/client';
   var PICKER_URL = 'https://apis.google.com/js/api.js';
-  var FILE_FIELDS = 'id,name,mimeType,version,etag,modifiedTime,size,webViewLink,trashed,parents';
+  var FILE_FIELDS = 'id,name,mimeType,version,modifiedTime,size,webViewLink,trashed,parents';
   var token = null;
   var tokenExpiry = 0;
   var email = null;
