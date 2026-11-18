@@ -1,5 +1,5 @@
 /* sw.js — offline cache for the app shell. */
-const VERSION = 'my-class-v1.1.2';
+const VERSION = 'my-class-v2.0.0';
 const CACHE_NAME = VERSION;
 const APP_SHELL = [
   './',
@@ -13,7 +13,8 @@ const APP_SHELL = [
   './db.js',
   './billing.js',
   './config.js',
-  './drive.js',
+  './api.js',
+  './auth.js',
   './portal.js',
   './sync.js',
   './ui.js',
@@ -21,6 +22,7 @@ const APP_SHELL = [
   './pages-classes.js',
   './pages-attendance.js',
   './pages-money.js',
+  './accounts.js',
   './app.js',
   './manifest.json',
   './icon-192.png',

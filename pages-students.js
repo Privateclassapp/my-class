@@ -67,7 +67,6 @@
     return App.normalizeSearch([
       student.name,
       student.phone,
-      student.googleEmail,
       student.level,
       typeLabel(student.type)
     ].join(' '));
@@ -236,18 +235,13 @@
                 '</select>' +
               '</label>' +
             '</div>' +
-            '<label class="field"><span>' + esc(t('cloud.studentEmail')) + '</span>' +
-              '<input class="input" name="googleEmail" type="email" dir="ltr" autocomplete="email" value="' + esc(student && student.googleEmail ? student.googleEmail : '') + '" placeholder="student@gmail.com">' +
-            '</label>' +
-            '<p class="hint">' + esc(t('cloud.studentEmailHint')) + '</p>' +
-            '<label class="switch-row"><input type="checkbox" name="portalEnabled"' + (student && student.portalEnabled === true ? ' checked' : '') + '><span>' + esc(t('cloud.portalEnabled')) + '</span></label>' +
-            '<p class="hint">' + esc(t('cloud.portalEnabledHint')) + '</p>' +
             '<label class="field"><span>' + esc(t('students.level')) + '</span>' +
               '<input class="input" name="level" value="' + esc(student ? student.level : '') + '" placeholder="' + esc(t('students.levelPlaceholder')) + '">' +
             '</label>' +
             '<label class="field"><span>' + esc(t('students.notes')) + '</span>' +
               '<textarea class="input textarea" name="notes" rows="3" placeholder="' + esc(t('students.notesPlaceholder')) + '">' + esc(student ? student.notes : '') + '</textarea>' +
             '</label>' +
+            '<p class="hint">' + esc(t('cloud.studentAccountHint')) + '</p>' +
           '</section>' +
 
           '<section class="card form-section">' +
@@ -320,31 +314,19 @@
           }
           var type = String(fd.get('type') || 'private');
           if (['private', 'semi', 'group'].indexOf(type) < 0) type = 'private';
-          var googleEmail = String(fd.get('googleEmail') || '').trim().toLowerCase();
-          if (googleEmail && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(googleEmail)) {
-            errorEl.textContent = t('cloud.invalidEmail');
-            errorEl.hidden = false;
-            return;
-          }
-          var portalEnabled = fd.get('portalEnabled') === 'on';
-          if (portalEnabled && !googleEmail) {
-            errorEl.textContent = t('cloud.portalNeedsEmail');
-            errorEl.hidden = false;
-            return;
-          }
           var next = Object.assign({}, student || {}, {
             id: student ? student.id : DB.uid(),
             name: name,
             phone: phoneRaw.replace(/\s+/g, ' '),
             type: type,
-            googleEmail: googleEmail,
-            portalEnabled: portalEnabled,
             level: String(fd.get('level') || '').trim(),
             notes: String(fd.get('notes') || '').trim(),
             archived: student ? !!student.archived : false,
             createdAt: student && student.createdAt ? student.createdAt : DB.now(),
             updatedAt: DB.now()
           });
+          delete next.googleEmail;
+          delete next.portalEnabled;
 
           var nextPlan = plan ? JSON.parse(JSON.stringify(plan)) : null;
           var wantsPrivate = toggle.checked;
@@ -534,101 +516,33 @@
     }
   }
 
-  function cloudErrorText(err) {
-    if (!err) return t('cloud.error');
-    if (err.code === 'NOT_CONFIGURED') return t('cloud.notConfigured');
-    if (err.code === 'NOT_CONNECTED') return t('cloud.connectFirst');
-    if (err.code === 'AUTH_REQUIRED' || err.code === 'AUTH_FAILED') return t('cloud.authRequired');
-    if (err.code === 'NO_EMAIL') return t('cloud.noEmail');
-    if (err.code === 'SYNC_CONFLICT') return t('cloud.conflict');
-    return err.message || t('cloud.error');
-  }
-
   function portalCardHtml(student) {
     var sync = window.Sync ? Sync.status() : null;
-    var connected = !!(sync && sync.meta && sync.meta.connected);
-    var autoSync = !!(sync && sync.meta && sync.meta.autoSync);
+    var authenticated = !!(sync && sync.authenticated);
+    var initialized = !!(sync && sync.initialized);
     var entry = window.Sync && Sync.getPortalMeta ? Sync.getPortalMeta(student.id) : null;
-    var hasEmail = !!student.googleEmail;
-    var enabled = hasEmail && student.portalEnabled === true;
-    var shared = !!(enabled && entry && entry.sharedEmail);
-    var status = !enabled
-      ? UI.badge(t('cloud.portalNotEnabled'), 'neutral')
-      : shared ? UI.badge(t('cloud.portalOn'), 'success') : UI.badge(t('cloud.portalPending'), 'amber');
+    var published = !!(authenticated && initialized && !student.archived && entry && entry.publishedAt);
+    var status = published ? UI.badge(t('cloud.portalOn'), 'success') : UI.badge(t('cloud.portalPending'), 'amber');
     var hints = [];
-    var actions = [];
-
-    if (!hasEmail) {
-      hints.push(t('cloud.portalNoEmailHint'));
-      actions.push('<button type="button" class="btn ghost btn-sm" data-edit>' + UI.icon('edit', 16) + ' ' + esc(t('common.edit')) + '</button>');
-    } else if (!enabled) {
-      hints.push(t('cloud.studentEmailHint'));
-      actions.push('<button type="button" class="btn ghost btn-sm" data-edit>' + UI.icon('edit', 16) + ' ' + esc(t('common.edit')) + '</button>');
-    } else if (!connected) {
-      hints.push(t('cloud.connectFirst'));
-      actions.push('<button type="button" class="btn ghost btn-sm" data-portal-settings>' + UI.icon('cloud', 16) + ' ' + esc(t('cloud.connect')) + '</button>');
-    } else {
-      hints.push(t('cloud.shareHint'));
-      actions.push('<button type="button" class="btn primary btn-sm" data-portal-publish>' + UI.icon('upload', 16) + ' ' +
-        esc(shared ? t('cloud.updateOne') : t('cloud.publishOne')) + '</button>');
-      actions.push('<a class="btn ghost btn-sm" href="' + esc(studentAppUrl()) + '" target="_blank" rel="noopener">' +
-        UI.icon('book', 16) + ' ' + esc(t('cloud.openStudentApp')) + '</a>');
-      actions.push('<button type="button" class="btn ghost btn-sm" data-portal-copy>' + UI.icon('cloud', 16) + ' ' + esc(t('cloud.copyStudentLink')) + '</button>');
-      if (entry && entry.folderId) {
-        actions.push('<a class="btn ghost btn-sm" href="https://drive.google.com/drive/folders/' + encodeURIComponent(entry.folderId) +
-          '" target="_blank" rel="noopener">' + UI.icon('drive', 16) + ' ' + esc(t('cloud.openDrive')) + '</a>');
-      }
-      if (shared) {
-        actions.push('<button type="button" class="btn ghost btn-sm danger-text" data-portal-revoke>' +
-          UI.icon('x', 16) + ' ' + esc(t('cloud.revokeAccess')) + '</button>');
-      }
-      if (autoSync) hints.push(t('cloud.portalAutoHint'));
-    }
-
-    if (entry && entry.publishedAt) {
+    if (!authenticated) {
+      hints.push(t('cloud.authRequired'));
+    } else if (entry && entry.publishedAt) {
       hints.push(t('cloud.portalPublishedAt', { date: date(String(entry.publishedAt).slice(0, 10)) }));
+    } else {
+      hints.push(t('cloud.portalAutoPublish'));
     }
-
+    if (student.archived) hints.push(t('cloud.portalArchivedHint'));
+    var actions = [
+      '<a class="btn ghost btn-sm" href="' + esc(studentAppUrl()) + '" target="_blank" rel="noopener">' +
+        UI.icon('book', 16) + ' ' + esc(t('cloud.openStudentApp')) + '</a>',
+      '<button type="button" class="btn ghost btn-sm" data-portal-copy>' + UI.icon('cloud', 16) + ' ' + esc(t('cloud.copyStudentLink')) + '</button>',
+      '<button type="button" class="btn ghost btn-sm" data-manage-account>' + UI.icon('user', 16) + ' ' + esc(t('accounts.open')) + '</button>'
+    ];
     return '<section class="card portal-card">' +
       '<div class="section-head"><h3>' + UI.icon('cloud', 18) + ' ' + esc(t('cloud.studentPortal')) + '</h3>' + status + '</div>' +
       hints.map(function (hint) { return '<p class="hint">' + esc(hint) + '</p>'; }).join('') +
-      (actions.length ? '<div class="settings-actions">' + actions.join('') + '</div>' : '') +
+      '<div class="settings-actions">' + actions.join('') + '</div>' +
     '</section>';
-  }
-
-  async function publishStudentPortal(student) {
-    if (!window.Sync || !Sync.publishOne) {
-      UI.alert({ title: t('cloud.studentPortal'), message: t('cloud.notConfigured') });
-      return;
-    }
-    try {
-      await Sync.publishOne(student.id);
-      await App.reloadData();
-      UI.toast(t('cloud.shareUpdated'), 'success');
-      App.rerender();
-    } catch (err) {
-      console.error(err);
-      UI.alert({ title: t('cloud.error'), message: cloudErrorText(err) });
-    }
-  }
-
-  async function revokeStudentPortal(student) {
-    if (!window.Sync || !Sync.revokeStudent) return;
-    var ok = await UI.confirm({
-      title: t('cloud.revokeAccess'),
-      message: t('cloud.revokeConfirm'),
-      confirmLabel: t('cloud.revokeAccess'),
-      danger: true
-    });
-    if (!ok) return;
-    try {
-      await Sync.revokeStudent(student.id);
-      UI.toast(t('cloud.revoked'), 'success');
-      App.rerender();
-    } catch (err) {
-      console.error(err);
-      UI.alert({ title: t('cloud.error'), message: cloudErrorText(err) });
-    }
   }
 
   async function copyStudentLink() {
@@ -859,11 +773,10 @@
           '<div class="profile-main">' +
             '<h2>' + esc(student.name) + '</h2>' +
             '<div class="profile-badges">' + typeBadge(student.type) + (student.archived ? UI.badge(t('students.archivedBadge'), 'neutral') : '') +
-              (student.googleEmail ? UI.badge(student.portalEnabled ? t('cloud.portalOn') : t('cloud.portalOff'), student.portalEnabled ? 'teal' : 'neutral') : '') + '</div>' +
+              (!student.archived && window.Sync && Sync.getPortalMeta && Sync.getPortalMeta(student.id) ? UI.badge(t('cloud.portalOn'), 'teal') : '') + '</div>' +
             '<div class="profile-meta">' +
               (student.phone ? '<a class="meta-link" dir="ltr" href="tel:' + esc(Fmt.toEnDigits(student.phone).replace(/[^\d+]/g, '')) + '">' + UI.icon('phone', 15) + ' ' + esc(Fmt.formatPhone(student.phone, I18n.lang)) + '</a>' : '<span class="meta-link muted">' + esc(t('students.noPhone')) + '</span>') +
               (student.level ? '<span class="meta-link">' + UI.icon('star', 15) + ' ' + esc(student.level) + '</span>' : '') +
-              (student.googleEmail ? '<span class="meta-link" dir="ltr">' + UI.icon('cloud', 15) + ' ' + esc(student.googleEmail) + '</span>' : '') +
             '</div>' +
             (student.createdAt ? '<p class="hint">' + esc(t('students.memberSince', { date: date(String(student.createdAt).slice(0, 10)) })) + '</p>' : '') +
           '</div>' +
@@ -927,17 +840,13 @@
         if (endBtn) endBtn.addEventListener('click', function () { endPrivatePlan(student); });
         var reactivateBtn = view.querySelector('[data-reactivate-private]');
         if (reactivateBtn) reactivateBtn.addEventListener('click', function () { reactivatePrivatePlan(student); });
-        view.querySelectorAll('[data-portal-publish]').forEach(function (b) {
-          b.addEventListener('click', function () { publishStudentPortal(student); });
-        });
-        view.querySelectorAll('[data-portal-revoke]').forEach(function (b) {
-          b.addEventListener('click', function () { revokeStudentPortal(student); });
-        });
         view.querySelectorAll('[data-portal-copy]').forEach(function (b) {
           b.addEventListener('click', function () { copyStudentLink(); });
         });
-        view.querySelectorAll('[data-portal-settings]').forEach(function (b) {
-          b.addEventListener('click', function () { App.navigate('#/settings'); });
+        view.querySelectorAll('[data-manage-account]').forEach(function (b) {
+          b.addEventListener('click', function () {
+            App.navigate('#/accounts?student=' + encodeURIComponent(student.id));
+          });
         });
       }
     };

@@ -4,12 +4,20 @@
   var LS = {
     lang: 'my-class-student-lang',
     theme: 'my-class-student-theme',
-    files: 'my-class-student-files-v1',
-    portal: 'my-class-student-portal-v1',
-    inbox: 'my-class-student-inbox-v1',
-    queue: 'my-class-student-queue-v1',
-    lastSync: 'my-class-student-last-sync-v1'
+    session: 'my-class-student-session-v2',
+    cache: 'my-class-student-cache-v2',
+    legacy: [
+      'my-class-student-files-v1',
+      'my-class-student-portal-v1',
+      'my-class-student-inbox-v1',
+      'my-class-student-queue-v1',
+      'my-class-student-last-sync-v1'
+    ]
   };
+
+  var MAX_PROOF_BYTES = 2097152;
+  var PROOF_TIMEOUT_MS = 90000;
+  var SESSION_SKEW_MS = 60000;
 
   var ICONS = {
     book: '<path d="M4 5.5A2.5 2.5 0 0 1 6.5 3H20v15H6.5A2.5 2.5 0 0 0 4 20.5Z"/><path d="M4 20.5V5.5M8 7h8M8 11h6"/>',
@@ -33,17 +41,14 @@
   };
 
   var state = {
+    session: null,
     portal: null,
-    inbox: null,
-    files: null,
-    queue: [],
-    email: '',
-    signedIn: false,
     busy: false,
     offline: !navigator.onLine,
     tab: 'home',
     error: '',
-    lastSync: ''
+    lastSync: '',
+    loginName: ''
   };
 
   var app = document.getElementById('studentApp');
@@ -106,20 +111,92 @@
     return err;
   }
 
-  function errorText(key) {
-    return t(key);
+  function isSessionValid(session) {
+    return !!(session &&
+      typeof session.token === 'string' &&
+      session.token &&
+      session.user &&
+      session.user.role === 'student' &&
+      session.user.studentId &&
+      Number(session.expiresAtMs) > Date.now() + SESSION_SKEW_MS);
+  }
+
+  function validPortal(portal, studentId) {
+    return !!(portal &&
+      portal.app === 'my-class-portal' &&
+      portal.schemaVersion === 1 &&
+      portal.studentId === studentId &&
+      portal.student &&
+      portal.student.id === studentId &&
+      portal.summary &&
+      typeof portal.summary === 'object' &&
+      Array.isArray(portal.grades) &&
+      Array.isArray(portal.notes) &&
+      Array.isArray(portal.proofs));
+  }
+
+  function isAuthError(err) {
+    return !!(err && (err.code === 'AUTH_REQUIRED' || err.code === 'ACCOUNT_DISABLED' || err.code === 'FORBIDDEN'));
   }
 
   function messageFor(err) {
     if (!err) return t('sp.errorGeneric');
-    if (err.code === 'NOT_CONFIGURED') return t('sp.notConfigured');
-    if (err.code === 'AUTH_REQUIRED' || err.code === 'AUTH_FAILED') return t('sp.authRequired');
-    if (err.code === 'PICKER_CANCELLED') return t('sp.pickerCancelled');
-    if (err.code === 'INVALID_JSON') return t('sp.portalLoadError');
-    if (err.status === 404 || err.status === 403) return t('sp.shareMissing');
-    if (err.code === 'sp.imageTooLarge' || err.code === 'sp.imageInvalid' || err.code === 'sp.imageReadError') return err.message;
+    var code = err.code;
+    if (code === 'NOT_CONFIGURED') return t('sp.notConfigured');
+    if (code === 'AUTH_FAILED') return t('sp.authFailed');
+    if (code === 'AUTH_LOCKED') return t('sp.authLocked');
+    if (code === 'AUTH_REQUIRED' || code === 'ACCOUNT_DISABLED' || code === 'FORBIDDEN') return t('sp.authRequired');
+    if (code === 'STUDENT_ONLY') return t('sp.studentOnly');
+    if (code === 'PORTAL_NOT_READY') return t('sp.portalNotReady');
+    if (code === 'INVALID_AMOUNT') return t('sp.amountInvalid');
+    if (code === 'INVALID_DATE') return t('sp.dateInvalid');
+    if (code === 'INVALID_IMAGE') return t('sp.imageInvalid');
+    if (code === 'IMAGE_TOO_LARGE') return t('sp.imageTooLarge');
+    if (code === 'INVALID_PORTAL' || code === 'DATA_CORRUPT') return t('sp.portalLoadError');
+    if (code === 'sp.imageTooLarge' || code === 'sp.imageInvalid' || code === 'sp.imageReadError') return err.message;
+    if (code === 'NETWORK_ERROR' || code === 'TIMEOUT' || code === 'HTTP_ERROR' || code === 'BAD_RESPONSE') return t('sp.connectionLost');
     if (!navigator.onLine) return t('sp.offlineNotice');
-    return err.message || t('sp.errorGeneric');
+    return t('sp.errorGeneric');
+  }
+
+  function saveSession() {
+    if (!state.session) {
+      remove(LS.session);
+      return;
+    }
+    write(LS.session, {
+      token: state.session.token,
+      expiresAt: state.session.expiresAt,
+      expiresAtMs: state.session.expiresAtMs,
+      user: state.session.user
+    });
+  }
+
+  function saveCache() {
+    if (!state.session || !state.portal) return;
+    write(LS.cache, {
+      studentId: state.session.user.studentId,
+      portal: state.portal,
+      lastSync: state.lastSync
+    });
+  }
+
+  function restoreCache() {
+    if (!state.session) return;
+    var cache = read(LS.cache, null);
+    if (!cache || cache.studentId !== state.session.user.studentId) return;
+    if (!validPortal(cache.portal, state.session.user.studentId)) return;
+    state.portal = cache.portal;
+    state.lastSync = cache.lastSync || '';
+  }
+
+  function clearAuth(message) {
+    state.session = null;
+    state.portal = null;
+    state.lastSync = '';
+    remove(LS.session);
+    remove(LS.cache);
+    state.error = message || '';
   }
 
   function toast(message, kind) {
@@ -152,22 +229,6 @@
 
   function setError(message) {
     state.error = message || '';
-  }
-
-  function saveCache() {
-    write(LS.files, state.files);
-    write(LS.portal, state.portal);
-    write(LS.inbox, state.inbox);
-    write(LS.queue, state.queue);
-    write(LS.lastSync, state.lastSync);
-  }
-
-  function clearCache() {
-    remove(LS.files);
-    remove(LS.portal);
-    remove(LS.inbox);
-    remove(LS.queue);
-    remove(LS.lastSync);
   }
 
   function statusBadge(balance) {
@@ -205,15 +266,12 @@
   }
 
   function pendingProofCount() {
-    var pending = state.queue.length;
-    if (state.portal && Array.isArray(state.portal.proofs)) {
-      pending += state.portal.proofs.filter(function (proof) { return proof.status === 'pending'; }).length;
-    }
-    return pending;
+    if (!state.portal || !Array.isArray(state.portal.proofs)) return 0;
+    return state.portal.proofs.filter(function (proof) { return proof.status === 'pending'; }).length;
   }
 
   function headerHtml() {
-    var teacher = state.portal && state.portal.teacherName ? state.portal.teacherName : t('sp.teacher');
+    var teacher = state.portal && state.portal.teacherName ? state.portal.teacherName : (state.session ? t('sp.student') : t('sp.subtitle'));
     var theme = document.documentElement.getAttribute('data-theme') || 'auto';
     return '<header class="sp-header">' +
       '<div class="sp-brand">' +
@@ -223,25 +281,29 @@
       '<div class="sp-header-actions">' +
         '<button type="button" class="sp-lang-btn" data-action="lang" aria-label="' + esc(t('sp.language')) + '">' + (I18n.lang === 'fa' ? 'EN' : 'FA') + '</button>' +
         '<button type="button" class="sp-icon-btn" data-action="theme" aria-label="' + esc(t('sp.theme')) + '" title="' + esc(t('sp.theme')) + '">' + icon(theme === 'dark' ? 'sun' : 'moon') + '</button>' +
-        (state.portal ? '<button type="button" class="sp-icon-btn" data-action="refresh" aria-label="' + esc(t('sp.homeRefresh')) + '" title="' + esc(t('sp.homeRefresh')) + '"' + (state.busy ? ' disabled' : '') + '>' + icon('refresh') + '</button>' : '') +
-        (state.portal ? '<button type="button" class="sp-icon-btn" data-action="signout" aria-label="' + esc(t('sp.homeSignOut')) + '" title="' + esc(t('sp.homeSignOut')) + '">' + icon('logout') + '</button>' : '') +
+        (state.session ? '<button type="button" class="sp-icon-btn" data-action="refresh" aria-label="' + esc(t('sp.homeRefresh')) + '" title="' + esc(t('sp.homeRefresh')) + '"' + (state.busy ? ' disabled' : '') + '>' + icon('refresh') + '</button>' : '') +
+        (state.session ? '<button type="button" class="sp-icon-btn" data-action="signout" aria-label="' + esc(t('sp.homeSignOut')) + '" title="' + esc(t('sp.homeSignOut')) + '">' + icon('logout') + '</button>' : '') +
       '</div>' +
     '</header>';
   }
 
   function authHtml() {
-    var configured = window.Drive && Drive.configured();
+    var configured = !!(window.Api && Api.isConfigured());
+    var disabled = !configured || state.busy;
     return '<main class="sp-main sp-auth">' +
       '<section class="sp-auth-card">' +
         '<div class="sp-auth-mark">' + icon('book', 32) + '</div>' +
         '<h1>' + esc(t('sp.title')) + '</h1>' +
         '<p>' + esc(t('sp.signInHint')) + '</p>' +
-        (state.error ? '<div class="sp-banner is-error" style="margin-top:12px">' + esc(state.error) + '</div>' : '') +
-        '<div class="sp-actions">' +
-          (configured
-            ? '<button type="button" class="sp-btn is-primary" data-action="signin"' + (state.busy ? ' disabled' : '') + '>' + icon('cloud') + ' ' + esc(state.busy ? t('sp.homeLoading') : t('sp.signIn')) + '</button>'
-            : '<div class="sp-banner is-warn" style="text-align:start">' + esc(t('sp.notConfigured')) + '<br>' + esc(t('sp.configHint')) + '</div>') +
-        '</div>' +
+        (state.error ? '<div class="sp-banner is-error">' + esc(state.error) + '</div>' : '') +
+        (!configured ? '<div class="sp-banner is-warn">' + esc(t('sp.notConfigured')) + '<br>' + esc(t('sp.configHint')) + '</div>' : '') +
+        '<form class="sp-form sp-auth-form" data-login-form novalidate>' +
+          '<label class="sp-field"><span>' + esc(t('sp.username')) + '</span>' +
+            '<input class="sp-input" name="username" type="text" dir="ltr" autocomplete="username" autocapitalize="none" spellcheck="false" maxlength="80" value="' + esc(state.loginName) + '"' + (disabled ? ' disabled' : '') + '></label>' +
+          '<label class="sp-field"><span>' + esc(t('sp.password')) + '</span>' +
+            '<input class="sp-input" name="password" type="password" dir="ltr" autocomplete="current-password" maxlength="128"' + (disabled ? ' disabled' : '') + '></label>' +
+          '<button type="submit" class="sp-btn is-primary sp-btn-block"' + (disabled ? ' disabled' : '') + '>' + icon('cloud') + ' ' + esc(state.busy ? t('sp.signingIn') : t('sp.signInSubmit')) + '</button>' +
+        '</form>' +
         '<p class="sp-auth-note">' + esc(t('sp.noServer')) + '</p>' +
       '</section>' +
     '</main>';
@@ -249,6 +311,17 @@
 
   function appHtml() {
     var offline = state.offline;
+    var banners = (offline ? '<div class="sp-banner is-warn">' + icon('cloud', 16) + ' ' + esc(t('sp.offlineNotice')) + '</div>' : '') +
+      (state.busy ? '<div class="sp-banner">' + icon('refresh', 16) + ' ' + esc(t('sp.homeLoading')) + '</div>' : '') +
+      (state.error ? '<div class="sp-banner is-error">' + icon('alert', 16) + '<span>' + esc(state.error) + ' <button type="button" class="sp-btn" style="margin-top:6px" data-action="refresh">' + esc(t('sp.tryAgain')) + '</button></span></div>' : '');
+    if (!state.portal) {
+      return '<main class="sp-main">' + banners +
+        '<section class="sp-card">' +
+          '<div class="sp-empty"><strong>' + esc(state.busy ? t('sp.loading') : t('sp.noPortal')) + '</strong><br>' + esc(t('sp.portalPendingHint')) + '</div>' +
+          '<div class="sp-actions"><button type="button" class="sp-btn is-primary" data-action="refresh"' + (state.busy ? ' disabled' : '') + '>' + icon('refresh') + ' ' + esc(t('sp.homeRefresh')) + '</button></div>' +
+        '</section>' +
+      '</main>';
+    }
     var tabs = [
       ['home', 'sp.dashboard'],
       ['money', 'sp.financial'],
@@ -257,11 +330,7 @@
       ['notes', 'sp.noteShort'],
       ['proofs', 'sp.proofShort']
     ];
-    return '<main class="sp-main">' +
-      (offline ? '<div class="sp-banner is-warn">' + icon('cloud', 16) + ' ' + esc(t('sp.offlineNotice')) + '</div>' : '') +
-      (state.busy ? '<div class="sp-banner">' + icon('refresh', 16) + ' ' + esc(t('sp.homeLoading')) + '</div>' : '') +
-      (!state.signedIn && !offline ? '<div class="sp-banner is-warn">' + icon('cloud', 16) + '<span>' + esc(t('sp.noToken')) + ' <button type="button" class="sp-btn is-primary" style="margin-top:6px" data-action="signin">' + esc(t('sp.signIn')) + '</button></span></div>' : '') +
-      (state.error ? '<div class="sp-banner is-error">' + icon('alert', 16) + '<span>' + esc(state.error) + ' <button type="button" class="sp-btn" style="margin-top:6px" data-action="refresh">' + esc(t('sp.tryAgain')) + '</button></span></div>' : '') +
+    return '<main class="sp-main">' + banners +
       '<nav class="sp-tabs" aria-label="' + esc(t('sp.more')) + '">' +
         tabs.map(function (item) {
           return '<button type="button" class="sp-tab' + (state.tab === item[0] ? ' is-active' : '') + '" data-tab="' + item[0] + '">' + esc(t(item[1])) + '</button>';
@@ -392,7 +461,7 @@
     '<section class="sp-card">' +
       '<div class="sp-section-head"><h2>' + esc(t('sp.moneyProofs')) + '</h2>' +
         '<button type="button" class="sp-btn is-primary" data-tab="proofs">' + icon('upload') + ' ' + esc(t('sp.submitProof')) + '</button></div>' +
-      (proofs.length || state.queue.length ? '<div class="sp-list">' + queueRowsHtml() + proofs.slice().reverse().map(proofRowHtml).join('') + '</div>' : '<div class="sp-empty">' + esc(t('sp.homeNoProofs')) + '</div>') +
+      (proofs.length ? '<div class="sp-list">' + proofs.slice().reverse().map(proofRowHtml).join('') + '</div>' : '<div class="sp-empty">' + esc(t('sp.homeNoProofs')) + '</div>') +
     '</section>';
   }
 
@@ -455,10 +524,10 @@
 
   function proofsHtml() {
     var proofs = state.portal.proofs || [];
-    var queue = state.queue;
     return '<section class="sp-card">' +
       '<div class="sp-section-head"><h2>' + esc(t('sp.submitProof')) + '</h2></div>' +
       '<p class="sp-sub">' + esc(t('sp.submitProofHint')) + '</p>' +
+      (state.offline ? '<div class="sp-banner is-warn">' + icon('cloud', 16) + ' ' + esc(t('sp.offlineSubmit')) + '</div>' : '') +
       '<form class="sp-form" data-proof-form novalidate>' +
         '<label class="sp-field"><span>' + esc(t('sp.amount')) + '</span>' +
           '<input class="sp-input" name="amount" inputmode="numeric" dir="ltr" autocomplete="off" placeholder="' + esc(t('sp.amount')) + '"></label>' +
@@ -472,29 +541,17 @@
         '<button type="submit" class="sp-btn is-primary sp-btn-block"' + (state.busy ? ' disabled' : '') + '>' + icon('upload') + ' ' + esc(state.busy ? t('sp.submitting') : t('sp.submit')) + '</button>' +
       '</form>' +
     '</section>' +
-    (queue.length ? '<div class="sp-queue"><strong>' + esc(t('sp.offlineQueue', { count: num(queue.length) })) + '</strong>' +
-      esc(t('sp.offlineQueueHint')) +
-      '<div class="sp-actions"><button type="button" class="sp-btn" data-action="retry-queue">' + esc(t('sp.retryQueue')) + '</button></div></div>' : '') +
     '<section class="sp-card">' +
       '<div class="sp-section-head"><h2>' + esc(t('sp.proofs')) + '</h2></div>' +
-      (proofs.length || queue.length ? '<div class="sp-list">' + queueRowsHtml() + proofs.slice().reverse().map(proofRowHtml).join('') + '</div>' : '<div class="sp-empty">' + esc(t('sp.noProofs')) + '</div>') +
+      (proofs.length ? '<div class="sp-list">' + proofs.slice().reverse().map(proofRowHtml).join('') + '</div>' : '<div class="sp-empty">' + esc(t('sp.noProofs')) + '</div>') +
     '</section>';
-  }
-
-  function queueRowsHtml() {
-    return state.queue.map(function (submission) {
-      return '<div class="sp-row"><span class="sp-row-main"><span class="sp-row-title">' + esc(money(submission.amount)) + ' · ' + esc(date(submission.date)) + '</span>' +
-        '<span class="sp-row-sub">' + esc(t('sp.offlineQueueHint')) + '</span></span>' +
-        '<span class="sp-row-end">' + proofBadge('pending') + '</span></div>';
-    }).join('');
   }
 
   function proofRowHtml(proof) {
     var note = proof.note ? '<span class="sp-row-sub is-wrap">' + esc(proof.note) + '</span>' : '';
     var review = proof.reviewNote ? '<span class="sp-row-sub is-wrap">' + esc(t('sp.reviewNote', { note: proof.reviewNote })) + '</span>' : '';
-    var link = proof.driveLink ? '<span class="sp-row-sub"><a href="' + esc(proof.driveLink) + '" target="_blank" rel="noopener">' + esc(t('sp.openInDrive')) + '</a></span>' : '';
     return '<div class="sp-row"><span class="sp-row-main"><span class="sp-row-title">' + esc(money(proof.amount)) + ' · ' + esc(date(proof.date)) + '</span>' +
-      note + review + link + '</span><span class="sp-row-end">' + proofBadge(proof.status) + '</span></div>';
+      note + review + '</span><span class="sp-row-end">' + proofBadge(proof.status) + '</span></div>';
   }
 
   function dateFieldHtml(iso) {
@@ -638,8 +695,119 @@
     });
   }
 
+  function fetchPortal() {
+    if (!state.session) return Promise.reject(makeError('AUTH_REQUIRED', t('sp.authRequired')));
+    return Api.call('studentGetPortal', { token: state.session.token }, { timeout: 30000 }).then(function (data) {
+      var studentId = state.session.user.studentId;
+      if (!data || !validPortal(data.portal, studentId)) {
+        throw makeError('INVALID_PORTAL', t('sp.portalLoadError'));
+      }
+      state.portal = data.portal;
+      state.lastSync = data.serverTime || new Date().toISOString();
+      saveCache();
+    });
+  }
+
+  function login(form) {
+    if (state.busy) return;
+    var username = String(form.elements.username.value || '').trim();
+    var password = String(form.elements.password.value || '');
+    state.loginName = username;
+    if (!username || !password) {
+      setError(t('sp.credentialsRequired'));
+      render();
+      return;
+    }
+    if (!window.Api || !Api.isConfigured()) {
+      setError(t('sp.notConfigured'));
+      render();
+      return;
+    }
+    if (!navigator.onLine) {
+      state.offline = true;
+      setError(t('sp.connectionLost'));
+      render();
+      return;
+    }
+    state.busy = true;
+    setError('');
+    render();
+    Api.call('authLogin', { username: username, password: password }, { timeout: 20000 }).then(function (data) {
+      if (!data || !data.token || !data.user || data.user.role !== 'student') {
+        if (data && data.token) {
+          Api.call('authLogout', { token: data.token }, { timeout: 8000 }).catch(function () {});
+        }
+        throw makeError('STUDENT_ONLY', t('sp.studentOnly'));
+      }
+      state.session = {
+        token: data.token,
+        expiresAt: data.expiresAt || '',
+        expiresAtMs: Number(data.expiresAtMs) || 0,
+        user: data.user
+      };
+      state.loginName = '';
+      var cache = read(LS.cache, null);
+      if (cache && cache.studentId === data.user.studentId && validPortal(cache.portal, data.user.studentId)) {
+        state.portal = cache.portal;
+        state.lastSync = cache.lastSync || '';
+      } else {
+        remove(LS.cache);
+        state.portal = null;
+        state.lastSync = '';
+      }
+      saveSession();
+      return fetchPortal().then(function () {
+        setError('');
+        toast(t('sp.portalUpdated'), 'success');
+      });
+    }).catch(function (err) {
+      if (isAuthError(err)) clearAuth(t('sp.authRequired'));
+      else setError(messageFor(err));
+    }).then(function () {
+      state.busy = false;
+      render();
+    });
+  }
+
+  function refresh(options) {
+    var opts = options || {};
+    if (!state.session || state.busy) return Promise.resolve();
+    if (!navigator.onLine) {
+      state.offline = true;
+      if (opts.notify) toast(t('sp.offlineNotice'));
+      render();
+      return Promise.resolve();
+    }
+    state.busy = true;
+    if (!opts.silent) setError('');
+    render();
+    return fetchPortal().then(function () {
+      state.offline = false;
+      setError('');
+      if (opts.notify) toast(t('sp.portalUpdated'), 'success');
+    }).catch(function (err) {
+      if (isAuthError(err)) {
+        clearAuth(t('sp.authRequired'));
+      } else {
+        setError(messageFor(err));
+      }
+    }).then(function () {
+      state.busy = false;
+      render();
+    });
+  }
+
   async function submitProof(form) {
     if (state.busy) return;
+    if (!state.session) {
+      clearAuth(t('sp.authRequired'));
+      render();
+      return;
+    }
+    if (!navigator.onLine) {
+      showFormError(form, t('sp.offlineSubmit'));
+      return;
+    }
     showFormError(form, '');
     var amount = Fmt.parseAmount(form.elements.amount.value);
     if (amount === null || amount <= 0) {
@@ -664,171 +832,62 @@
     state.busy = true;
     var submitBtn = form.querySelector('button[type="submit"]');
     if (submitBtn) submitBtn.disabled = true;
+    var uploaded = false;
     try {
-      var compressed = await compressImage(file, Number(window.APP_CONFIG && APP_CONFIG.maxProofBytes) || 2097152);
-      var submission = Portal.makeSubmission({
+      var compressed = await compressImage(file, MAX_PROOF_BYTES);
+      await Api.call('studentSubmitReceipt', {
+        token: state.session.token,
         amount: amount,
         date: iso,
         note: note,
         mime: compressed.mime,
         fileName: compressed.fileName,
         data: compressed.data
-      });
-      state.queue.push(submission);
-      saveCache();
-      render();
+      }, { timeout: PROOF_TIMEOUT_MS });
+      uploaded = true;
+      var portalError = '';
       try {
-        await uploadQueue();
-        toast(t('sp.submitted'), 'success');
+        await fetchPortal();
       } catch (err) {
-        console.error(err);
-        toast(t('sp.queued'), 'success');
-      }
-      setError('');
-    } catch (err) {
-      console.error(err);
-      showFormError(form, messageFor(err));
-    } finally {
-      state.busy = false;
-      render();
-    }
-  }
-
-  async function uploadQueue() {
-    if (!state.queue.length) return 0;
-    if (!state.portal || !state.files || !state.files.inbox) throw makeError('NO_INBOX', t('sp.noInbox'));
-    await Drive.ensureToken({ interactive: false });
-    var lastError = null;
-    for (var attempt = 0; attempt < 2; attempt++) {
-      try {
-        var remote = await Drive.getJsonFile(state.files.inbox.id);
-        var check = Portal.validateInbox(remote.data, state.portal.studentId);
-        if (!check.ok) throw makeError('INVALID_INBOX', t('sp.inboxLoadError'));
-        var inbox = remote.data;
-        state.queue.forEach(function (submission) {
-          inbox = Portal.appendSubmission(inbox, submission);
-        });
-        await Drive.updateJsonFile(state.files.inbox.id, inbox, remote.etag);
-        state.inbox = inbox;
-        state.queue = [];
-        state.lastSync = new Date().toISOString();
-        saveCache();
-        return 1;
-      } catch (err) {
-        lastError = err;
-        if ((err.status === 409 || err.status === 412) && attempt === 0) continue;
-        throw err;
-      }
-    }
-    throw lastError || makeError('UPLOAD_FAILED', t('sp.proofUploadError'));
-  }
-
-  async function chooseFiles() {
-    var docs = await Drive.pickFiles({ mimeTypes: 'application/json' });
-    if (!docs || !docs.length) throw makeError('PICKER_CANCELLED', t('sp.pickerCancelled'));
-    var portalDoc = docs.find(function (doc) { return /portal/i.test(doc.name || ''); });
-    var inboxDoc = docs.find(function (doc) { return /inbox/i.test(doc.name || ''); });
-    if (!portalDoc || !inboxDoc) throw makeError('WRONG_FILES', t('sp.wrongFiles'));
-    state.files = {
-      portal: { id: portalDoc.id, name: portalDoc.name },
-      inbox: { id: inboxDoc.id, name: inboxDoc.name }
-    };
-    state.queue = [];
-    state.inbox = null;
-    state.portal = null;
-    saveCache();
-    await loadRemote();
-  }
-
-  async function loadRemote() {
-    if (!state.files || !state.files.portal || !state.files.inbox) throw makeError('NO_FILES', t('sp.shareMissing'));
-    var portalFile = await Drive.getJsonFile(state.files.portal.id);
-    var portalCheck = Portal.validatePortal(portalFile.data);
-    if (!portalCheck.ok) throw makeError('INVALID_PORTAL', t('sp.portalLoadError'));
-    var inboxFile = await Drive.getJsonFile(state.files.inbox.id);
-    var inboxCheck = Portal.validateInbox(inboxFile.data, portalFile.data.studentId);
-    if (!inboxCheck.ok) throw makeError('INVALID_INBOX', t('sp.inboxLoadError'));
-    state.portal = portalFile.data;
-    state.inbox = inboxFile.data;
-    state.lastSync = new Date().toISOString();
-    saveCache();
-  }
-
-  async function refresh() {
-    if (state.busy) return;
-    if (!navigator.onLine) {
-      setError(t('sp.offlineNotice'));
-      render();
-      return;
-    }
-    state.busy = true;
-    setError('');
-    render();
-    try {
-      await Drive.ensureToken({ interactive: true });
-      state.signedIn = true;
-      try { state.email = await Drive.getEmail(); } catch (_) { state.email = ''; }
-      if (!state.files) await chooseFiles();
-      else {
-        try {
-          await loadRemote();
-        } catch (err) {
-          if (err.status === 404 || err.status === 403) {
-            state.files = null;
-            saveCache();
-            await chooseFiles();
-          } else {
-            throw err;
-          }
+        if (isAuthError(err)) {
+          clearAuth(t('sp.authRequired'));
+          state.busy = false;
+          render();
+          return;
         }
+        portalError = messageFor(err);
       }
-      if (state.queue.length) await uploadQueue();
-      toast(t('sp.portalUpdated'), 'success');
-    } catch (err) {
-      console.error(err);
-      setError(messageFor(err));
-    } finally {
+      setError(portalError);
+      if (state.session) toast(t('sp.submitted'), 'success');
       state.busy = false;
       render();
+    } catch (err) {
+      state.busy = false;
+      if (isAuthError(err)) {
+        clearAuth(t('sp.authRequired'));
+        render();
+        return;
+      }
+      if (submitBtn) submitBtn.disabled = false;
+      showFormError(form, uploaded ? t('sp.submitted') : messageFor(err));
     }
   }
 
-  async function retryQueue() {
-    if (state.busy) return;
-    state.busy = true;
-    setError('');
+  function signOut() {
+    var session = state.session;
+    clearAuth('');
+    state.busy = false;
+    state.loginName = '';
     render();
-    try {
-      await Drive.ensureToken({ interactive: true });
-      await uploadQueue();
-      toast(t('sp.submitted'), 'success');
-    } catch (err) {
-      console.error(err);
-      setError(messageFor(err));
-    } finally {
-      state.busy = false;
-      render();
+    if (session && navigator.onLine) {
+      Api.call('authLogout', { token: session.token }, { timeout: 8000 }).catch(function () {});
     }
-  }
-
-  async function signOut() {
-    await Drive.signOut();
-    state.portal = null;
-    state.inbox = null;
-    state.files = null;
-    state.queue = [];
-    state.email = '';
-    state.signedIn = false;
-    state.lastSync = '';
-    clearCache();
-    setError('');
-    render();
     toast(t('sp.signedOut'), 'success');
   }
 
   function render() {
     if (!app) return;
-    if (!state.portal) {
+    if (!state.session) {
       app.innerHTML = headerHtml() + authHtml();
       return;
     }
@@ -865,20 +924,24 @@
         var next = current === 'auto' ? 'dark' : current === 'dark' ? 'light' : 'auto';
         applyTheme(next);
         render();
-      } else if (action === 'signin' || action === 'refresh') {
-        refresh();
+      } else if (action === 'refresh') {
+        refresh({ notify: true });
       } else if (action === 'signout') {
         signOut();
-      } else if (action === 'retry-queue') {
-        retryQueue();
       }
     });
 
     document.addEventListener('submit', function (event) {
-      var form = event.target.closest('[data-proof-form]');
-      if (!form || !app.contains(form)) return;
+      var loginForm = event.target.closest('[data-login-form]');
+      if (loginForm && app.contains(loginForm)) {
+        event.preventDefault();
+        login(loginForm);
+        return;
+      }
+      var proofForm = event.target.closest('[data-proof-form]');
+      if (!proofForm || !app.contains(proofForm)) return;
       event.preventDefault();
-      submitProof(form);
+      submitProof(proofForm);
     });
 
     window.addEventListener('hashchange', function () {
@@ -891,8 +954,8 @@
 
     window.addEventListener('online', function () {
       state.offline = false;
-      render();
-      if (state.signedIn && state.portal) refresh();
+      if (state.session) refresh({ silent: true });
+      else render();
     });
 
     window.addEventListener('offline', function () {
@@ -913,20 +976,21 @@
     if (lang === 'en' || lang === 'fa') I18n.lang = lang;
     I18n.apply();
     document.title = t('sp.title');
-    var theme = read(LS.theme, 'auto');
-    applyTheme(theme);
-    state.files = read(LS.files, null);
-    state.portal = read(LS.portal, null);
-    state.inbox = read(LS.inbox, null);
-    state.queue = read(LS.queue, []);
-    state.lastSync = read(LS.lastSync, '');
-    if (!Array.isArray(state.queue)) state.queue = [];
-    if (state.portal && !Portal.validatePortal(state.portal).ok) state.portal = null;
-    if (state.portal && state.portal.studentId && state.inbox && !Portal.validateInbox(state.inbox, state.portal.studentId).ok) state.inbox = null;
+    applyTheme(read(LS.theme, 'auto'));
+    LS.legacy.forEach(remove);
+    var session = read(LS.session, null);
+    if (isSessionValid(session)) {
+      state.session = session;
+      restoreCache();
+    } else {
+      if (session) remove(LS.session);
+      remove(LS.cache);
+    }
     state.tab = currentTab();
     bindGlobal();
     render();
     registerSW();
+    if (state.session && navigator.onLine) refresh({ silent: true });
   }
 
   init();

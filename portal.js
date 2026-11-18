@@ -133,8 +133,7 @@
         status: proof.status,
         submittedAt: proof.submittedAt || proof.createdAt || '',
         reviewedAt: proof.reviewedAt || '',
-        reviewNote: proof.reviewNote || '',
-        driveLink: proof.driveLink || ''
+        reviewNote: proof.reviewNote || ''
       };
     }).sort(function (a, b) {
       return String(b.submittedAt).localeCompare(String(a.submittedAt));

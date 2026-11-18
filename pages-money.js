@@ -33,7 +33,7 @@
   }
 
   function studentSearchText(student) {
-    return App.normalizeSearch([student.name, student.phone, student.level, student.googleEmail].join(' '));
+    return App.normalizeSearch([student.name, student.phone, student.level].join(' '));
   }
 
   function studentName(id) {
@@ -259,7 +259,6 @@
         '<div><dt>' + esc(t('cloud.proofAmount')) + '</dt><dd>' + esc(money(proof.amount)) + '</dd></div>' +
         '<div><dt>' + esc(t('cloud.proofDate')) + '</dt><dd>' + esc(date(proof.date)) + '</dd></div>' +
         (proof.note ? '<div><dt>' + esc(t('cloud.proofNote')) + '</dt><dd>' + esc(proof.note) + '</dd></div>' : '') +
-        (proof.driveLink ? '<div><dt>' + esc(t('cloud.viewProof')) + '</dt><dd><a class="text-link" href="' + esc(proof.driveLink) + '" target="_blank" rel="noopener">' + esc(t('cloud.viewProof')) + '</a></dd></div>' : '') +
       '</dl></div>';
     var choice = await UI.dialog({
       title: t('cloud.proofReview'),
@@ -272,11 +271,11 @@
       ],
       onMount: function (el) {
         var wrap = el.querySelector('[data-proof-preview]');
-        if (!wrap || !proof.driveFileId || !window.Drive) {
+        if (!wrap || !window.Sync || !Sync.getReceiptImage) {
           if (wrap) wrap.innerHTML = '<p class="hint">' + esc(t('cloud.proofMissing')) + '</p>';
           return;
         }
-        Drive.getFileBlob(proof.driveFileId).then(function (blob) {
+        Sync.getReceiptImage(proof).then(function (blob) {
           var url = URL.createObjectURL(blob);
           var img = document.createElement('img');
           img.alt = t('cloud.proofReview');

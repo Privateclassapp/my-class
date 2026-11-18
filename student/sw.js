@@ -1,4 +1,4 @@
-const VERSION = 'my-class-student-v1.1.0';
+const VERSION = 'my-class-student-v2.0.0';
 const CACHE_NAME = VERSION;
 const APP_SHELL = [
   './',
@@ -7,12 +7,11 @@ const APP_SHELL = [
   './student.js',
   './manifest.json',
   '../config.js',
+  '../api.js',
   '../i18n.js',
   '../format.js',
   '../jalali.js',
   '../jalaali-vendor.js',
-  '../drive.js',
-  '../portal.js',
   '../Vazirmatn-Variable.woff2',
   '../icon-192.png',
   '../icon-512.png',

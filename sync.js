@@ -1,7 +1,7 @@
 (function (root) {
   'use strict';
 
-  var META_KEY = 'drive';
+  var META_KEY = 'sync';
   var AUTO_SYNC_DELAY = 6000;
   var state = {
     meta: null,
@@ -11,12 +11,11 @@
     dirty: false,
     applying: false,
     pushTimer: null,
-    lastError: ''
+    lastError: '',
+    pendingChoice: null,
+    changeSeq: 0,
+    accountId: null
   };
-
-  function config() {
-    return root.APP_CONFIG || {};
-  }
 
   function now() {
     return root.DB ? root.DB.now() : new Date().toISOString();
@@ -35,17 +34,17 @@
   function defaultMeta() {
     return {
       key: META_KEY,
-      connected: false,
-      email: '',
-      folderId: '',
-      dataFileId: '',
-      dataVersion: '',
-      dataRevision: 0,
+      initialized: false,
+      revision: 0,
+      remoteRevision: 0,
+      remoteUpdatedAt: '',
       lastSyncedAt: '',
       lastPublishedAt: '',
-      lastInboxAt: '',
+      lastReceiptAt: '',
       autoSync: true,
+      publishedCount: 0,
       portals: {},
+      dirty: false,
       lastError: ''
     };
   }
@@ -53,26 +52,56 @@
   function normalizeMeta(meta) {
     var next = Object.assign(defaultMeta(), meta || {});
     next.key = META_KEY;
+    next.revision = Math.max(0, Number(next.revision) || 0);
+    next.remoteRevision = Math.max(0, Number(next.remoteRevision) || 0);
+    next.publishedCount = Math.max(0, Number(next.publishedCount) || 0);
     next.portals = next.portals && typeof next.portals === 'object' ? next.portals : {};
     next.autoSync = next.autoSync !== false;
+    next.initialized = next.initialized === true;
+    next.dirty = next.dirty === true;
     return next;
   }
 
+  function ensureAccount() {
+    if (!state.accountId || !root.DB || root.DB.accountId() !== state.accountId) {
+      throw makeError('ACCOUNT_CHANGED', 'The active account changed.');
+    }
+  }
+
   function saveMeta(patch) {
+    ensureAccount();
     state.meta = normalizeMeta(Object.assign({}, state.meta || {}, patch || {}));
     state.meta.updatedAt = now();
     return root.DB.put('meta', state.meta).then(function () { return state.meta; });
   }
 
-  function requireConnected() {
-    if (!state.meta || !state.meta.connected || !state.meta.dataFileId) {
-      throw makeError('NOT_CONNECTED', 'Google Drive is not connected');
-    }
-    return state.meta;
+  function isOnline() {
+    return !root.navigator || root.navigator.onLine !== false;
   }
 
-  function ensureAuth(interactive) {
-    return root.Drive.ensureToken({ interactive: !!interactive });
+  function requireSession() {
+    if (!root.Auth || !root.Auth.valid()) throw makeError('AUTH_REQUIRED', 'Sign in required.');
+    if (!root.Api || !root.Api.isConfigured()) throw makeError('NOT_CONFIGURED', 'The backend URL is not configured.');
+    if (!isOnline()) throw makeError('OFFLINE', 'You are offline.');
+  }
+
+  function call(action, payload) {
+    return root.Auth.call(action, payload || {}, { timeout: 60000 });
+  }
+
+  function reportError(err) {
+    state.lastError = err && err.message ? err.message : 'Sync failed';
+    if (state.meta) {
+      state.meta.lastError = state.lastError;
+      root.DB.put('meta', state.meta).catch(function () {});
+    }
+    var code = err && err.code;
+    if ((code === 'AUTH_REQUIRED' || code === 'AUTH_EXPIRED' || code === 'ACCOUNT_DISABLED') &&
+        root.dispatchEvent && typeof root.CustomEvent === 'function') {
+      try {
+        root.dispatchEvent(new root.CustomEvent('my-class-auth-expired', { detail: { code: code } }));
+      } catch (_) {}
+    }
   }
 
   function bindEvents() {
@@ -81,548 +110,470 @@
     root.addEventListener('my-class-data-changed', function () {
       if (state.applying) return;
       state.dirty = true;
+      state.changeSeq++;
+      saveMeta({ dirty: true }).catch(function () {});
       scheduleAutoSync();
     });
     root.addEventListener('online', function () {
-      if (state.meta && state.meta.connected && state.meta.autoSync) scheduleAutoSync(1000);
+      if (state.meta && state.meta.initialized && state.meta.autoSync) scheduleAutoSync(1000);
     });
   }
 
   function scheduleAutoSync(delay) {
-    if (!state.meta || !state.meta.connected || !state.meta.autoSync) return;
-    if (!root.Drive || !root.Drive.configured()) return;
+    if (!state.meta || !state.meta.initialized || !state.meta.autoSync) return;
+    if (!state.dirty || !isOnline()) return;
+    if (!root.Auth || !root.Auth.valid() || !root.Api || !root.Api.isConfigured()) return;
     if (state.pushTimer) clearTimeout(state.pushTimer);
     state.pushTimer = setTimeout(function () {
       state.pushTimer = null;
-      syncNow({ interactive: false, silent: true }).catch(function () {});
+      syncNow({ silent: true }).catch(function () {});
     }, delay == null ? AUTO_SYNC_DELAY : delay);
   }
 
   function init() {
     if (state.initialized) return Promise.resolve(state.meta);
     state.initialized = true;
+    state.accountId = root.DB.accountId() || null;
     bindEvents();
     return root.DB.get('meta', META_KEY).then(function (meta) {
       state.meta = normalizeMeta(meta);
-      state.dirty = !!(state.meta.connected && state.meta.dataFileId);
+      state.dirty = state.meta.dirty === true;
       state.lastError = state.meta.lastError || '';
+      state.pendingChoice = null;
+      state.changeSeq = 0;
       return state.meta;
     }).catch(function (err) {
-      state.lastError = err && err.message ? err.message : 'Could not load Drive settings';
+      state.lastError = err && err.message ? err.message : 'Could not load sync settings';
       state.meta = normalizeMeta(null);
       return state.meta;
     });
   }
 
   function status() {
-    var driveStatus = root.Drive && root.Drive.status ? root.Drive.status() : { configured: false, missing: [], authenticated: false, email: '' };
+    var auth = root.Auth ? root.Auth.status() : { hasSession: false, valid: false, expired: false, user: null };
     return {
-      configured: driveStatus.configured,
-      missing: driveStatus.missing || [],
-      authenticated: driveStatus.authenticated,
-      email: driveStatus.email || (state.meta && state.meta.email) || '',
+      configured: !!(root.Api && root.Api.isConfigured()),
+      authenticated: auth.valid,
+      expired: auth.expired,
+      user: auth.user,
+      online: isOnline(),
+      initialized: !!(state.meta && state.meta.initialized),
       meta: clone(state.meta || defaultMeta()),
       busy: state.busy,
       dirty: state.dirty,
-      lastError: state.lastError
+      lastError: state.lastError,
+      needsChoice: !!state.pendingChoice
     };
   }
 
-  function applyRemote(remote, file, folder, address) {
-    var check = root.DB.validateBackup(remote.data);
-    if (!check.ok) throw makeError('INVALID_REMOTE', 'Drive data is not a valid backup');
+  function validateRemote(remote) {
+    if (!remote || !remote.data) return { ok: true, empty: true, counts: null };
+    var check = root.DB.validateBackup({
+      app: 'my-class',
+      schemaVersion: root.DB.DB_VERSION,
+      data: remote.data,
+      settings: {}
+    });
+    if (!check.ok) throw makeError('INVALID_REMOTE', 'Server data is not valid.');
+    return { ok: true, empty: false, counts: check.counts };
+  }
+
+  function remotePortals(remote) {
+    var entries = {};
+    var publishedAt = remote && (remote.portalPublishedAt || remote.updatedAt) || '';
+    var ids = remote && Array.isArray(remote.portals) ? remote.portals : [];
+    ids.forEach(function (studentId) {
+      if (!studentId) return;
+      entries[String(studentId)] = { publishedAt: publishedAt, published: true };
+    });
+    return entries;
+  }
+
+  function applyRemote(remote) {
+    validateRemote(remote);
+    var revision = Number(remote.revision) || 0;
+    var portals = remotePortals(remote);
     state.applying = true;
-    return root.DB.importReplace(remote.data).then(function () {
+    return root.DB.importReplace({
+      app: 'my-class',
+      schemaVersion: root.DB.DB_VERSION,
+      exportedAt: remote.updatedAt || now(),
+      settings: {},
+      data: remote.data
+    }).then(function () {
       state.applying = false;
       state.dirty = false;
+      state.changeSeq = 0;
+      state.pendingChoice = null;
       return saveMeta({
-        connected: true,
-        email: address || state.meta.email || '',
-        folderId: folder.id,
-        dataFileId: file.id,
-        dataVersion: remote.version || '',
-        dataRevision: Number(remote.data.revision) || 0,
+        initialized: true,
+        revision: revision,
+        remoteRevision: revision,
+        remoteUpdatedAt: remote.updatedAt || '',
         lastSyncedAt: now(),
+        lastPublishedAt: remote.portalPublishedAt || remote.updatedAt || '',
+        publishedCount: Object.keys(portals).length,
+        portals: portals,
+        dirty: false,
         lastError: ''
       });
     }).then(function () {
       if (root.App && root.App.reloadData) return root.App.reloadData();
       return null;
+    }).then(function () {
+      return { mode: 'pulled', revision: revision };
     }).catch(function (err) {
       state.applying = false;
       throw err;
     });
   }
 
-  function uploadLocal(file, folder, address, remoteMeta) {
-    return root.DB.exportAll().then(function (payload) {
-      payload.revision = Number(state.meta && state.meta.dataRevision || 0) + 1;
-      payload.exportedAt = now();
-      if (file) {
-        return root.Drive.updateJsonFile(file.id, payload, remoteMeta && remoteMeta.etag).then(function (meta) {
-          return { meta: meta, file: file, payload: payload };
+  function buildPortals(data) {
+    if (!root.Portal || !root.Billing) return [];
+    var billing;
+    try {
+      billing = root.Billing.computeAll(data, { today: root.Jalali.todayISO() });
+    } catch (_) {
+      return [];
+    }
+    var teacherName = (root.App && root.App.settings && root.App.settings.teacherName) ||
+      (root.Auth && root.Auth.user() ? root.Auth.user().displayName : '') || '';
+    var generatedAt = now();
+    var portals = [];
+    data.students.forEach(function (student) {
+      if (!student || student.archived) return;
+      try {
+        portals.push({
+          studentId: student.id,
+          portal: root.Portal.buildStudentPortal(data, student, billing.byId[student.id], {
+            now: generatedAt,
+            teacherName: teacherName
+          })
         });
+      } catch (err) {
+        console.error('Could not build portal for student', student.id, err);
       }
-      return root.Drive.createJsonFile(folder.id, 'data.json', payload).then(function (meta) {
-        return { meta: meta, file: meta, payload: payload };
+    });
+    return portals;
+  }
+
+  function pushLocal(baseRevision) {
+    var startSeq = state.changeSeq;
+    return Promise.all([root.DB.exportAll(), root.DB.getSettings()]).then(function (result) {
+      var payload = result[0];
+      var settings = result[1] || {};
+      var teacherName = settings.teacherName || (root.Auth.user() ? root.Auth.user().displayName : '') || '';
+      var portals = buildPortals(payload.data);
+      return call('teacherPush', {
+        baseRevision: baseRevision,
+        data: payload.data,
+        profile: { teacherName: teacherName },
+        portals: portals
+      }).then(function (pushed) {
+        var publishedAt = now();
+        var entries = {};
+        var publishedIds = Array.isArray(pushed.portalStudentIds) ? pushed.portalStudentIds : [];
+        publishedIds.forEach(function (studentId) {
+          if (studentId) entries[String(studentId)] = { publishedAt: publishedAt, published: true };
+        });
+        var stillDirty = state.changeSeq !== startSeq;
+        state.dirty = stillDirty;
+        return saveMeta({
+          initialized: true,
+          revision: Number(pushed.revision) || 0,
+          remoteRevision: Number(pushed.revision) || 0,
+          remoteUpdatedAt: pushed.updatedAt || '',
+          lastSyncedAt: publishedAt,
+          lastPublishedAt: publishedAt,
+          publishedCount: Number(pushed.published) || publishedIds.length,
+          portals: entries,
+          dirty: stillDirty,
+          lastError: ''
+        }).then(function (meta) {
+          if (stillDirty) scheduleAutoSync();
+          return { mode: 'pushed', revision: meta.revision, published: meta.publishedCount };
+        });
       });
-    }).then(function (result) {
-      state.dirty = false;
-      return saveMeta({
-        connected: true,
-        email: address || state.meta.email || '',
-        folderId: folder.id,
-        dataFileId: result.file.id,
-        dataVersion: result.meta.version || '',
-        dataRevision: result.payload.revision,
-        lastSyncedAt: now(),
-        lastError: ''
-      }).then(function () { return result; });
+    }).catch(function (err) {
+      if (err && err.code === 'SYNC_CONFLICT') {
+        var details = err.details || {};
+        if (state.meta) {
+          state.meta.remoteRevision = Number(details.revision) || state.meta.remoteRevision;
+          state.meta.remoteUpdatedAt = details.updatedAt || state.meta.remoteUpdatedAt;
+        }
+      }
+      throw err;
     });
   }
 
-  function connect(options) {
-    var opts = options || {};
-    if (!root.Drive.configured()) return Promise.reject(makeError('NOT_CONFIGURED', 'Google Drive is not configured'));
-    return root.Drive.ensureToken({ interactive: true }).then(function () {
-      return root.Drive.getUserInfo();
-    }).then(function (info) {
-      var address = String(info.email || '').toLowerCase();
-      return root.Drive.ensureFolder(config().driveFolderName || 'Class Manager').then(function (folder) {
-        return root.Drive.findFile(folder.id, 'data.json').then(function (file) {
-          if (!file) {
-            return uploadLocal(null, folder, address, null).then(function () {
-              return { mode: 'created', email: address, folderId: folder.id };
-            });
+  function markInitialized(revision) {
+    return saveMeta({
+      initialized: true,
+      revision: Number(revision) || 0,
+      remoteRevision: Number(revision) || 0,
+      lastSyncedAt: now(),
+      lastPublishedAt: '',
+      publishedCount: 0,
+      portals: {},
+      dirty: false,
+      lastError: ''
+    });
+  }
+
+  function initializeFromRemote(remote) {
+    var revision = Number(remote.revision) || 0;
+    var check = validateRemote(remote);
+    var hasRemote = revision > 0 && !check.empty;
+    return root.DB.hasData().then(function (hasLocal) {
+      if (!hasRemote) {
+        if (!hasLocal) return markInitialized(0).then(function () { return { mode: 'idle' }; });
+        return pushLocal(0);
+      }
+      if (!hasLocal) {
+        return applyRemote(remote).then(function () { return { mode: 'pulled', revision: revision }; });
+      }
+      state.pendingChoice = {
+        remoteRevision: revision,
+        remoteUpdatedAt: remote.updatedAt || '',
+        remoteCounts: check.counts
+      };
+      return {
+        mode: 'choice',
+        needsChoice: true,
+        remoteRevision: revision,
+        remoteUpdatedAt: remote.updatedAt || '',
+        remoteCounts: check.counts
+      };
+    });
+  }
+
+  function readReceipts() {
+    return Promise.all([root.DB.loadData(), root.DB.getAll('proofs')]).then(function (result) {
+      var data = result[0];
+      var existing = result[1];
+      var students = {};
+      data.students.forEach(function (student) { students[student.id] = true; });
+      var seen = {};
+      existing.forEach(function (proof) {
+        if (proof.submissionId) seen[proof.submissionId] = true;
+        if (proof.id && proof.id.indexOf('proof-') === 0) seen[proof.id.slice(6)] = true;
+      });
+      return call('teacherListReceipts', {}).then(function (response) {
+        ensureAccount();
+        var receipts = response && Array.isArray(response.receipts) ? response.receipts : [];
+        var ackIds = [];
+        var imported = [];
+        var chain = Promise.resolve();
+        receipts.forEach(function (receipt) {
+          if (!receipt || !receipt.id) return;
+          var id = String(receipt.id);
+          if (!students[receipt.studentId]) return;
+          if (seen[id]) {
+            ackIds.push(id);
+            return;
           }
-          return root.Drive.getFileMeta(file.id).then(function (meta) {
-            if (opts.strategy === 'remote') {
-              return root.Drive.getJsonFile(file.id).then(function (remote) {
-                return applyRemote(remote, file, folder, address).then(function () {
-                  return { mode: 'remote', email: address, folderId: folder.id };
-                });
-              });
-            }
-            if (opts.strategy === 'local') {
-              return uploadLocal(file, folder, address, meta).then(function () {
-                return { mode: 'local', email: address, folderId: folder.id };
-              });
-            }
-            return root.Drive.getJsonFile(file.id).then(function (remote) {
-              var check = root.DB.validateBackup(remote.data);
-              return {
-                needsChoice: true,
-                email: address,
-                folderId: folder.id,
-                dataFileId: file.id,
-                remoteModifiedTime: file.modifiedTime || '',
-                remoteCounts: check.ok ? check.counts : null
-              };
-            });
+          var amount = Number(receipt.amount);
+          if (!isFinite(amount) || amount <= 0) return;
+          if (!/^\d{4}-\d{2}-\d{2}$/.test(String(receipt.date || ''))) return;
+          var proof = {
+            id: 'proof-' + id,
+            submissionId: id,
+            remoteId: id,
+            studentId: String(receipt.studentId),
+            amount: amount,
+            date: String(receipt.date),
+            note: String(receipt.note || '').slice(0, 500),
+            mime: String(receipt.mime || 'image/jpeg'),
+            fileName: String(receipt.fileName || ''),
+            status: 'pending',
+            submittedAt: receipt.submittedAt || now(),
+            createdAt: now(),
+            updatedAt: now(),
+            reviewNote: ''
+          };
+          chain = chain.then(function () {
+            return root.DB.put('proofs', proof);
+          }).then(function () {
+            data.proofs.push(proof);
+            seen[id] = true;
+            imported.push(proof);
+            ackIds.push(id);
           });
         });
-      });
-    }).catch(function (err) {
-      state.lastError = err && err.message ? err.message : 'Google Drive connection failed';
-      throw err;
-    });
-  }
-
-  function disconnect() {
-    if (state.pushTimer) {
-      clearTimeout(state.pushTimer);
-      state.pushTimer = null;
-    }
-    return root.Drive.signOut().then(function () {
-      state.dirty = false;
-      return saveMeta({ connected: false, lastError: '' });
-    });
-  }
-
-  function lock() {
-    if (state.pushTimer) {
-      clearTimeout(state.pushTimer);
-      state.pushTimer = null;
-    }
-    root.Drive.clearToken();
-  }
-
-  function reset() {
-    if (state.pushTimer) {
-      clearTimeout(state.pushTimer);
-      state.pushTimer = null;
-    }
-    if (root.Drive && root.Drive.clearToken) root.Drive.clearToken();
-    state.meta = normalizeMeta(null);
-    state.initialized = false;
-    state.busy = false;
-    state.dirty = false;
-    state.applying = false;
-    state.lastError = '';
-  }
-
-  function pull() {
-    var meta = requireConnected();
-    return ensureAuth(false).then(function () {
-      return root.Drive.getJsonFile(meta.dataFileId);
-    }).then(function (remote) {
-      return root.Drive.getFileMeta(meta.dataFileId).then(function (fileMeta) {
-        var file = { id: meta.dataFileId };
-        return applyRemote(remote, file, { id: meta.folderId }, meta.email).then(function () {
-          return saveMeta({ dataVersion: fileMeta.version || remote.version || '' });
-        });
-      });
-    }).then(function () {
-      return { mode: 'pulled' };
-    }).catch(function (err) {
-      state.lastError = err && err.message ? err.message : 'Pull failed';
-      throw err;
-    });
-  }
-
-  function push(force) {
-    var meta = requireConnected();
-    return ensureAuth(false).then(function () {
-      return root.Drive.getFileMeta(meta.dataFileId);
-    }).then(function (remoteMeta) {
-      if (!force && meta.dataVersion && remoteMeta.version && remoteMeta.version !== meta.dataVersion) {
-        throw makeError('SYNC_CONFLICT', 'Drive data changed on another device');
-      }
-      return uploadLocal({ id: meta.dataFileId }, { id: meta.folderId }, meta.email, remoteMeta);
-    }).then(function () {
-      return { mode: 'pushed' };
-    }).catch(function (err) {
-      state.lastError = err && err.message ? err.message : 'Push failed';
-      throw err;
-    });
-  }
-
-  function updateJsonRetry(fileId, value) {
-    return root.Drive.getFileMeta(fileId).then(function (meta) {
-      return root.Drive.updateJsonFile(fileId, value, meta.etag);
-    }).catch(function (err) {
-      if (err && (err.status === 412 || err.status === 409)) {
-        return root.Drive.getFileMeta(fileId).then(function (meta) {
-          return root.Drive.updateJsonFile(fileId, value, meta.etag);
-        });
-      }
-      throw err;
-    });
-  }
-
-  function share(fileId, address, role) {
-    if (!fileId || !address) return Promise.resolve(null);
-    return root.Drive.ensurePermission(fileId, address, role);
-  }
-
-  function revoke(fileId, address) {
-    if (!fileId || !address) return Promise.resolve(false);
-    return root.Drive.removePermissionForEmail(fileId, address).catch(function (err) {
-      if (err && err.status === 404) return false;
-      throw err;
-    });
-  }
-
-  function publishStudent(student, data, billing, teacherName) {
-    var address = String(student.googleEmail || '').trim().toLowerCase();
-    if (!address) return Promise.reject(makeError('NO_EMAIL', 'Student has no Google email'));
-    var rootFolder = state.meta.folderId;
-    var previous = state.meta.portals[student.id] || {};
-    var portal = root.Portal.buildStudentPortal(data, student, billing.byId[student.id], {
-      now: now(),
-      teacherName: teacherName
-    });
-    var hash = root.Portal.hash(Object.assign({}, portal, { generatedAt: '' }));
-    return root.Drive.ensureFolder('student-' + student.id, rootFolder).then(function (folder) {
-      var portalPromise;
-      if (previous.portalFileId && previous.hash === hash) {
-        portalPromise = Promise.resolve({ id: previous.portalFileId });
-      } else if (previous.portalFileId) {
-        portalPromise = updateJsonRetry(previous.portalFileId, portal).catch(function (err) {
-          if (err && err.status === 404) {
-            return root.Drive.createJsonFile(folder.id, 'portal.json', portal);
+        state.applying = true;
+        return chain.then(function () {
+          state.applying = false;
+          if (!imported.length) {
+            if (ackIds.length) call('teacherAckReceipts', { ids: ackIds }).catch(function () {});
+            return 0;
           }
+          state.dirty = true;
+          state.changeSeq++;
+          return saveMeta({ dirty: true, lastReceiptAt: now() }).then(function () {
+            if (ackIds.length) {
+              return call('teacherAckReceipts', { ids: ackIds }).catch(function () {});
+            }
+            return null;
+          }).then(function () {
+            scheduleAutoSync();
+            return imported.length;
+          });
+        }).catch(function (err) {
+          state.applying = false;
           throw err;
         });
-      } else {
-        portalPromise = root.Drive.findFile(folder.id, 'portal.json').then(function (existing) {
-          if (existing) return updateJsonRetry(existing.id, portal);
-          return root.Drive.createJsonFile(folder.id, 'portal.json', portal);
-        });
-      }
-      return portalPromise.then(function (portalFile) {
-        var inboxPromise = previous.inboxFileId
-          ? Promise.resolve({ id: previous.inboxFileId })
-          : root.Drive.findFile(folder.id, 'inbox.json').then(function (existing) {
-            if (existing) return existing;
-            return root.Drive.createJsonFile(folder.id, 'inbox.json', root.Portal.emptyInbox(student.id));
-          });
-        return inboxPromise.then(function (inboxFile) {
-          var shares = [];
-          if (previous.sharedEmail && previous.sharedEmail !== address) {
-            shares.push(revoke(portalFile.id, previous.sharedEmail));
-            shares.push(revoke(inboxFile.id, previous.sharedEmail));
-          }
-          shares.push(share(portalFile.id, address, 'reader'));
-          shares.push(share(inboxFile.id, address, 'writer'));
-          return Promise.all(shares).then(function () {
-            var entry = {
-              folderId: folder.id,
-              portalFileId: portalFile.id,
-              inboxFileId: inboxFile.id,
-              hash: hash,
-              portalVersion: portalFile.version || '',
-              inboxVersion: inboxFile.version || '',
-              sharedEmail: address,
-              publishedAt: now()
-            };
-            state.meta.portals[student.id] = entry;
-            return saveMeta({ portals: state.meta.portals });
-          });
-        });
       });
+    }).then(function (count) {
+      if (count && root.App && root.App.reloadData) {
+        return root.App.reloadData().then(function () { return count; });
+      }
+      return count;
     });
   }
 
-  function revokeStudent(studentId) {
-    var entry = state.meta && state.meta.portals ? state.meta.portals[studentId] : null;
-    if (!entry) return Promise.resolve(false);
-    return ensureAuth(true).then(function () {
-      var tasks = [];
-      if (entry.sharedEmail) {
-        tasks.push(revoke(entry.portalFileId, entry.sharedEmail));
-        tasks.push(revoke(entry.inboxFileId, entry.sharedEmail));
-      }
-      return Promise.all(tasks).then(function () {
-        entry.sharedEmail = '';
-        entry.hash = '';
-        entry.revokedAt = now();
-        state.meta.portals[studentId] = entry;
-        return saveMeta({ portals: state.meta.portals }).then(function () { return true; });
-      });
-    });
+  function conflictError(remote) {
+    var err = makeError('SYNC_CONFLICT', 'Teacher data changed on another device.');
+    err.details = {
+      revision: Number(remote && remote.revision) || 0,
+      updatedAt: remote && remote.updatedAt || ''
+    };
+    return err;
   }
 
-  function publishPortals(options) {
+  function syncOnce(options) {
     var opts = options || {};
-    var meta = requireConnected();
-    return ensureAuth(opts.interactive === true).then(function () {
-      return root.DB.loadData();
-    }).then(function (data) {
-      var billing = root.Billing.computeAll(data, { today: root.Jalali.todayISO() });
-      return root.DB.getSettings().then(function (settings) {
-        var teacherName = config().teacherName || (settings && settings.teacherName) || '';
-        var students = data.students.slice().sort(function (a, b) {
-          return String(a.name || '').localeCompare(String(b.name || ''), 'fa');
-        });
-        var published = 0;
-        var revoked = 0;
-        var chain = Promise.resolve();
-        students.forEach(function (student) {
-          chain = chain.then(function () {
-            var shouldPublish = !student.archived && student.portalEnabled === true && !!student.googleEmail;
-            var entry = state.meta.portals[student.id];
-            if (!shouldPublish) {
-              if (entry && entry.sharedEmail) {
-                return revokeStudent(student.id).then(function (done) { if (done) revoked++; });
-              }
-              return null;
-            }
-            return publishStudent(student, data, billing, teacherName).then(function () { published++; });
+    return init().then(function () {
+      requireSession();
+      ensureAccount();
+      return call('teacherPull', {});
+    }).then(function (remote) {
+      var remoteRevision = Number(remote.revision) || 0;
+      if (!state.meta.initialized) {
+        return initializeFromRemote(remote).then(function (result) {
+          if (result && result.needsChoice) return result;
+          return readReceipts().then(function (count) {
+            result.receipts = count;
+            return result;
           });
         });
-        return chain.then(function () {
-          return saveMeta({
-            lastPublishedAt: now(),
-            lastError: '',
-            portals: state.meta.portals
-          }).then(function () {
-            return { published: published, revoked: revoked, folderId: meta.folderId };
+      }
+      if (remoteRevision > state.meta.revision) {
+        if (state.dirty) throw conflictError(remote);
+        return applyRemote(remote).then(function () {
+          return readReceipts();
+        }).then(function (count) {
+          return { mode: 'pulled', receipts: count };
+        });
+      }
+      if (remoteRevision < state.meta.revision) {
+        throw conflictError(remote);
+      }
+      if (state.dirty || opts.publish) {
+        return pushLocal(remoteRevision).then(function (result) {
+          return readReceipts().then(function (count) {
+            result.receipts = count;
+            return result;
           });
         });
+      }
+      return readReceipts().then(function (count) {
+        return { mode: 'idle', receipts: count };
       });
-    }).catch(function (err) {
-      state.lastError = err && err.message ? err.message : 'Publishing failed';
-      throw err;
-    });
-  }
-
-  function publishOne(studentId) {
-    var meta = requireConnected();
-    return ensureAuth(true).then(function () {
-      return Promise.all([root.DB.loadData(), root.DB.getSettings()]);
-    }).then(function (result) {
-      var data = result[0];
-      var settings = result[1];
-      var student = data.students.find(function (s) { return s.id === studentId; });
-      if (!student) throw makeError('NOT_FOUND', 'Student not found');
-      if (!student.googleEmail) throw makeError('NO_EMAIL', 'Student has no Google email');
-      var billing = root.Billing.computeAll(data, { today: root.Jalali.todayISO() });
-      var teacherName = config().teacherName || (settings && settings.teacherName) || '';
-      return publishStudent(student, data, billing, teacherName).then(function () {
-        return saveMeta({ lastPublishedAt: now(), portals: state.meta.portals });
-      });
-    }).then(function () {
-      return { folderId: meta.folderId };
-    });
-  }
-
-  function readInboxes() {
-    var meta = requireConnected();
-    return ensureAuth(false).then(function () {
-      return root.DB.loadData();
-    }).then(function (data) {
-      var processed = 0;
-      var chain = Promise.resolve();
-      Object.keys(meta.portals).forEach(function (studentId) {
-        var entry = meta.portals[studentId];
-        if (!entry || !entry.inboxFileId || !entry.sharedEmail) return;
-        var student = data.students.find(function (s) { return s.id === studentId; });
-        if (!student) return;
-        chain = chain.then(function () {
-          return root.Drive.getJsonFile(entry.inboxFileId).then(function (remote) {
-            var check = root.Portal.validateInbox(remote.data, studentId);
-            if (!check.ok || !remote.data.submissions.length) return null;
-            var inbox = remote.data;
-            var maxBytes = Number(config().maxProofBytes) || 2097152;
-            var folderPromise = null;
-            var subChain = Promise.resolve();
-            var before = processed;
-            inbox.submissions.forEach(function (submission) {
-              subChain = subChain.then(function () {
-                if (!submission || !submission.id) return null;
-                var exists = data.proofs.some(function (proof) {
-                  return proof.submissionId === submission.id || proof.id === 'proof-' + submission.id;
-                });
-                if (exists) return null;
-                if (typeof submission.amount !== 'number' || !isFinite(submission.amount) || submission.amount <= 0) return null;
-                if (!/^\d{4}-\d{2}-\d{2}$/.test(String(submission.date || ''))) return null;
-                if (typeof submission.data !== 'string' || !submission.data) return null;
-                var mime = submission.mime || 'image/jpeg';
-                if (!/^image\/(jpeg|png|webp)$/.test(mime)) return null;
-                var bytes;
-                try { bytes = root.Drive.base64ToBytes(submission.data); } catch (_) { return null; }
-                if (!bytes.length || bytes.length > maxBytes) return null;
-                if (!folderPromise) {
-                  folderPromise = root.Drive.ensureFolder('proofs', entry.folderId);
-                }
-                return folderPromise.then(function (folder) {
-                  var ext = mime === 'image/png' ? 'png' : mime === 'image/webp' ? 'webp' : 'jpg';
-                  var name = 'proof-' + submission.id + '.' + ext;
-                  return root.Drive.createFile({
-                    name: name,
-                    mimeType: mime,
-                    parents: [folder.id],
-                    appProperties: { app: 'my-class', studentId: studentId, submissionId: submission.id }
-                  }, bytes, mime).then(function (file) {
-                    var proof = {
-                      id: 'proof-' + submission.id,
-                      submissionId: submission.id,
-                      studentId: studentId,
-                      amount: submission.amount,
-                      date: submission.date,
-                      note: String(submission.note || '').slice(0, 500),
-                      mime: mime,
-                      fileName: name,
-                      driveFileId: file.id,
-                      driveLink: file.webViewLink || ('https://drive.google.com/file/d/' + file.id + '/view'),
-                      status: 'pending',
-                      submittedAt: submission.submittedAt || now(),
-                      createdAt: now(),
-                      updatedAt: now(),
-                      reviewNote: ''
-                    };
-                    return root.DB.put('proofs', proof).then(function () {
-                      data.proofs.push(proof);
-                      processed++;
-                    });
-                  });
-                });
-              });
-            });
-            return subChain.then(function () {
-              if (processed === before) return null;
-              var cleaned = Object.assign({}, inbox, {
-                submissions: [],
-                processedAt: now(),
-                updatedAt: now()
-              });
-              return root.Drive.updateJsonFile(entry.inboxFileId, cleaned, remote.etag).catch(function (err) {
-                if (err && (err.status === 412 || err.status === 409)) return null;
-                throw err;
-              });
-            });
-          }).catch(function (err) {
-            if (err && (err.status === 404 || err.code === 'INVALID_JSON')) return null;
-            throw err;
-          });
-        });
-      });
-      return chain.then(function () {
-        return saveMeta({ lastInboxAt: now(), portals: state.meta.portals });
-      }).then(function () {
-        if (processed && root.App && root.App.reloadData) return root.App.reloadData().then(function () { return processed; });
-        return processed;
-      });
-    }).catch(function (err) {
-      state.lastError = err && err.message ? err.message : 'Inbox check failed';
-      throw err;
     });
   }
 
   function syncNow(options) {
     var opts = options || {};
     if (state.busy) return Promise.resolve({ mode: 'busy' });
-    if (!state.meta || !state.meta.connected || !state.meta.dataFileId) {
-      return Promise.reject(makeError('NOT_CONNECTED', 'Google Drive is not connected'));
-    }
     state.busy = true;
     state.lastError = '';
-    var meta = state.meta;
-    return ensureAuth(!!opts.interactive).then(function () {
-      return root.Drive.getFileMeta(meta.dataFileId);
-    }).then(function (remoteMeta) {
-      if (remoteMeta.version && meta.dataVersion && remoteMeta.version !== meta.dataVersion) {
-        if (state.dirty) throw makeError('SYNC_CONFLICT', 'Drive data changed on another device');
-        return root.Drive.getJsonFile(meta.dataFileId).then(function (remote) {
-          return applyRemote(remote, { id: meta.dataFileId }, { id: meta.folderId }, meta.email).then(function () {
-            return saveMeta({ dataVersion: remoteMeta.version, lastError: '' });
-          });
-        }).then(function () {
-          return { mode: 'pulled' };
-        });
-      }
-      if (state.dirty || opts.forcePush) {
-        return uploadLocal({ id: meta.dataFileId }, { id: meta.folderId }, meta.email, remoteMeta).then(function () {
-          return publishPortals();
-        }).then(function () {
-          return { mode: 'pushed' };
-        });
-      }
-      return publishPortals().then(function () {
-        return readInboxes();
-      }).then(function (count) {
-        if (!count) return { mode: 'idle' };
-        return root.Drive.getFileMeta(meta.dataFileId).then(function (nextMeta) {
-          return uploadLocal({ id: meta.dataFileId }, { id: meta.folderId }, meta.email, nextMeta);
-        }).then(function () {
-          return publishPortals();
-        }).then(function () {
-          return { mode: 'inbox', count: count };
-        });
-      });
-    }).catch(function (err) {
-      state.lastError = err && err.message ? err.message : 'Sync failed';
-      if (state.meta) {
-        state.meta.lastError = state.lastError;
-        root.DB.put('meta', state.meta).catch(function () {});
-      }
-      throw err;
+    return Promise.resolve().then(function () {
+      return syncOnce(opts);
     }).then(function (result) {
       state.busy = false;
       return result;
     }, function (err) {
       state.busy = false;
+      reportError(err);
+      throw err;
+    });
+  }
+
+  function start(options) {
+    if (!root.Auth || !root.Auth.valid()) return Promise.resolve({ mode: 'offline' });
+    if (!root.Api || !root.Api.isConfigured()) return Promise.reject(makeError('NOT_CONFIGURED', 'The backend URL is not configured.'));
+    if (!isOnline()) return Promise.resolve({ mode: 'offline' });
+    return syncNow(options || {});
+  }
+
+  function applyChoice(strategy) {
+    if (state.busy) return Promise.resolve({ mode: 'busy' });
+    if (strategy !== 'remote' && strategy !== 'local') {
+      return Promise.reject(makeError('INVALID_CHOICE', 'Invalid sync choice.'));
+    }
+    state.busy = true;
+    state.lastError = '';
+    return init().then(function () {
+      requireSession();
+      return call('teacherPull', {});
+    }).then(function (remote) {
+      state.pendingChoice = null;
+      if (strategy === 'remote') {
+        return applyRemote(remote).then(function () {
+          return readReceipts();
+        }).then(function (count) {
+          return { mode: 'pulled', receipts: count };
+        });
+      }
+      return pushLocal(Number(remote.revision) || 0).then(function (result) {
+        return readReceipts().then(function (count) {
+          result.receipts = count;
+          return result;
+        });
+      });
+    }).then(function (result) {
+      state.busy = false;
+      return result;
+    }, function (err) {
+      state.busy = false;
+      reportError(err);
+      throw err;
+    });
+  }
+
+  function pull() {
+    return init().then(function () {
+      requireSession();
+      ensureAccount();
+      return call('teacherPull', {});
+    }).then(function (remote) {
+      return applyRemote(remote);
+    }).then(function (result) {
+      return readReceipts().then(function (count) {
+        result.receipts = count;
+        return result;
+      });
+    }).catch(function (err) {
+      reportError(err);
+      throw err;
+    });
+  }
+
+  function push(force) {
+    return init().then(function () {
+      requireSession();
+      ensureAccount();
+      if (!force) return pushLocal(state.meta.revision);
+      return call('teacherPull', {}).then(function (remote) {
+        return pushLocal(Number(remote.revision) || 0);
+      });
+    }).then(function (result) {
+      return readReceipts().then(function (count) {
+        result.receipts = count;
+        return result;
+      });
+    }).catch(function (err) {
+      reportError(err);
       throw err;
     });
   }
@@ -672,6 +623,7 @@
       throw makeError('INVALID_ACTION', 'Invalid review action');
     }).then(function (proof) {
       state.dirty = true;
+      state.changeSeq++;
       scheduleAutoSync();
       if (root.App && root.App.reloadData) return root.App.reloadData().then(function () { return proof; });
       return proof;
@@ -691,28 +643,101 @@
     return saveMeta({ autoSync: !!enabled });
   }
 
-  function driveFolderUrl() {
-    return state.meta && state.meta.folderId ? 'https://drive.google.com/drive/folders/' + encodeURIComponent(state.meta.folderId) : '';
+  function publishPortals() {
+    return syncNow({ publish: true });
+  }
+
+  function base64ToBlob(text, mime) {
+    var binary = root.atob(String(text || ''));
+    var bytes = new Uint8Array(binary.length);
+    for (var i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+    return new root.Blob([bytes], { type: mime || 'image/jpeg' });
+  }
+
+  function getReceiptImage(proofOrId) {
+    var receiptId = typeof proofOrId === 'string' ? proofOrId :
+      (proofOrId && (proofOrId.remoteId || proofOrId.submissionId)) || '';
+    if (!receiptId) return Promise.reject(makeError('MISSING_RECEIPT', 'Receipt image is unavailable.'));
+    requireSession();
+    return call('teacherGetReceiptImage', { receiptId: receiptId }).then(function (result) {
+      if (!result || !result.data) throw makeError('MISSING_RECEIPT', 'Receipt image is unavailable.');
+      return base64ToBlob(result.data, result.mime);
+    });
+  }
+
+  function deleteAll() {
+    requireSession();
+    return call('teacherDeleteAll', {}).then(function (result) {
+      state.pendingChoice = null;
+      state.dirty = false;
+      return {
+        revision: Number(result && result.revision) || 0,
+        updatedAt: result && result.updatedAt || '',
+        deletedReceipts: Number(result && result.deletedReceipts) || 0
+      };
+    }).catch(function (err) {
+      reportError(err);
+      throw err;
+    });
+  }
+
+  function markClean(revision, updatedAt) {
+    var rev = Number(revision) || 0;
+    state.dirty = false;
+    state.changeSeq = 0;
+    state.pendingChoice = null;
+    return saveMeta({
+      initialized: true,
+      revision: rev,
+      remoteRevision: rev,
+      remoteUpdatedAt: updatedAt || '',
+      lastSyncedAt: now(),
+      lastPublishedAt: '',
+      lastReceiptAt: '',
+      publishedCount: 0,
+      portals: {},
+      dirty: false,
+      lastError: ''
+    });
+  }
+
+  function lock() {
+    if (state.pushTimer) {
+      clearTimeout(state.pushTimer);
+      state.pushTimer = null;
+    }
+  }
+
+  function reset() {
+    lock();
+    state.meta = normalizeMeta(null);
+    state.initialized = false;
+    state.busy = false;
+    state.dirty = false;
+    state.applying = false;
+    state.pendingChoice = null;
+    state.lastError = '';
+    state.changeSeq = 0;
+    state.accountId = null;
   }
 
   root.Sync = {
     init: init,
+    start: start,
     status: status,
-    connect: connect,
-    disconnect: disconnect,
-    lock: lock,
-    reset: reset,
+    syncNow: syncNow,
+    applyChoice: applyChoice,
     pull: pull,
     push: push,
-    syncNow: syncNow,
     publishPortals: publishPortals,
-    publishOne: publishOne,
-    revokeStudent: revokeStudent,
-    readInboxes: readInboxes,
     reviewProof: reviewProof,
     pendingProofs: pendingProofs,
     getPortalMeta: getPortalMeta,
     setAutoSync: setAutoSync,
-    driveFolderUrl: driveFolderUrl
+    getReceiptImage: getReceiptImage,
+    deleteAll: deleteAll,
+    markClean: markClean,
+    lock: lock,
+    reset: reset
   };
 })(typeof globalThis !== 'undefined' ? globalThis : this);

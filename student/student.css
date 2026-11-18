@@ -845,6 +845,20 @@ a {
   justify-content: center;
 }
 
+.sp-auth-card .sp-banner {
+  margin-top: 12px;
+  text-align: start;
+}
+
+.sp-auth-form {
+  margin-top: 14px;
+  text-align: start;
+}
+
+.sp-auth-form .sp-field > span {
+  text-align: start;
+}
+
 .sp-auth-note {
   color: var(--sp-muted);
   font-size: 0.68rem;

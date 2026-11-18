@@ -2,15 +2,74 @@
 (function (root) {
   'use strict';
 
-  var DB_NAME = 'my-class-db';
+  var LEGACY_DB_NAME = 'my-class-db';
+  var ACCOUNT_DB_PREFIX = 'my-class-db-account-';
+  var DB_NAME = LEGACY_DB_NAME;
   var DB_VERSION = 2;
   var DATA_STORES = ['students', 'classes', 'enrollments', 'sessions', 'attendance', 'grades', 'payments', 'notes', 'proofs'];
   var ALL_STORES = ['meta'].concat(DATA_STORES);
   var dbPromise = null;
+  var activeAccountId = '';
 
-  function open() {
-    if (dbPromise) return dbPromise;
-    dbPromise = new Promise(function (resolve, reject) {
+  function accountDbName(accountId) {
+    var safe = String(accountId || '').replace(/[^A-Za-z0-9_-]/g, '_').slice(0, 120);
+    return safe ? ACCOUNT_DB_PREFIX + safe : LEGACY_DB_NAME;
+  }
+
+  function upgrade(db) {
+    if (!db.objectStoreNames.contains('meta')) db.createObjectStore('meta', { keyPath: 'key' });
+    if (!db.objectStoreNames.contains('students')) {
+      var s = db.createObjectStore('students', { keyPath: 'id' });
+      s.createIndex('archived', 'archived', { unique: false });
+    }
+    if (!db.objectStoreNames.contains('classes')) {
+      var c = db.createObjectStore('classes', { keyPath: 'id' });
+      c.createIndex('archived', 'archived', { unique: false });
+    }
+    if (!db.objectStoreNames.contains('enrollments')) {
+      var e = db.createObjectStore('enrollments', { keyPath: 'id' });
+      e.createIndex('classId', 'classId', { unique: false });
+      e.createIndex('studentId', 'studentId', { unique: false });
+    }
+    if (!db.objectStoreNames.contains('sessions')) {
+      var se = db.createObjectStore('sessions', { keyPath: 'id' });
+      se.createIndex('date', 'date', { unique: false });
+      se.createIndex('classId', 'classId', { unique: false });
+      se.createIndex('studentId', 'studentId', { unique: false });
+      se.createIndex('sessionKey', 'sessionKey', { unique: true });
+    }
+    if (!db.objectStoreNames.contains('attendance')) {
+      var a = db.createObjectStore('attendance', { keyPath: 'id' });
+      a.createIndex('sessionId', 'sessionId', { unique: false });
+      a.createIndex('studentId', 'studentId', { unique: false });
+      a.createIndex('sessionStudent', ['sessionId', 'studentId'], { unique: true });
+    }
+    if (!db.objectStoreNames.contains('grades')) {
+      var g = db.createObjectStore('grades', { keyPath: 'id' });
+      g.createIndex('studentId', 'studentId', { unique: false });
+      g.createIndex('date', 'date', { unique: false });
+    }
+    if (!db.objectStoreNames.contains('payments')) {
+      var p = db.createObjectStore('payments', { keyPath: 'id' });
+      p.createIndex('studentId', 'studentId', { unique: false });
+      p.createIndex('date', 'date', { unique: false });
+    }
+    if (!db.objectStoreNames.contains('notes')) {
+      var n = db.createObjectStore('notes', { keyPath: 'id' });
+      n.createIndex('classId', 'classId', { unique: false });
+      n.createIndex('studentId', 'studentId', { unique: false });
+      n.createIndex('date', 'date', { unique: false });
+    }
+    if (!db.objectStoreNames.contains('proofs')) {
+      var pr = db.createObjectStore('proofs', { keyPath: 'id' });
+      pr.createIndex('studentId', 'studentId', { unique: false });
+      pr.createIndex('status', 'status', { unique: false });
+      pr.createIndex('submissionId', 'submissionId', { unique: true });
+    }
+  }
+
+  function openNamed(name) {
+    return new Promise(function (resolve, reject) {
       if (!root.indexedDB) {
         var err = new Error('IndexedDB is not available');
         err.code = 'DB_UNAVAILABLE';
@@ -19,63 +78,12 @@
       }
       var req;
       try {
-        req = indexedDB.open(DB_NAME, DB_VERSION);
+        req = indexedDB.open(name, DB_VERSION);
       } catch (e) {
         reject(e);
         return;
       }
-      req.onupgradeneeded = function (event) {
-        var db = event.target.result;
-        if (!db.objectStoreNames.contains('meta')) db.createObjectStore('meta', { keyPath: 'key' });
-        if (!db.objectStoreNames.contains('students')) {
-          var s = db.createObjectStore('students', { keyPath: 'id' });
-          s.createIndex('archived', 'archived', { unique: false });
-        }
-        if (!db.objectStoreNames.contains('classes')) {
-          var c = db.createObjectStore('classes', { keyPath: 'id' });
-          c.createIndex('archived', 'archived', { unique: false });
-        }
-        if (!db.objectStoreNames.contains('enrollments')) {
-          var e = db.createObjectStore('enrollments', { keyPath: 'id' });
-          e.createIndex('classId', 'classId', { unique: false });
-          e.createIndex('studentId', 'studentId', { unique: false });
-        }
-        if (!db.objectStoreNames.contains('sessions')) {
-          var se = db.createObjectStore('sessions', { keyPath: 'id' });
-          se.createIndex('date', 'date', { unique: false });
-          se.createIndex('classId', 'classId', { unique: false });
-          se.createIndex('studentId', 'studentId', { unique: false });
-          se.createIndex('sessionKey', 'sessionKey', { unique: true });
-        }
-        if (!db.objectStoreNames.contains('attendance')) {
-          var a = db.createObjectStore('attendance', { keyPath: 'id' });
-          a.createIndex('sessionId', 'sessionId', { unique: false });
-          a.createIndex('studentId', 'studentId', { unique: false });
-          a.createIndex('sessionStudent', ['sessionId', 'studentId'], { unique: true });
-        }
-        if (!db.objectStoreNames.contains('grades')) {
-          var g = db.createObjectStore('grades', { keyPath: 'id' });
-          g.createIndex('studentId', 'studentId', { unique: false });
-          g.createIndex('date', 'date', { unique: false });
-        }
-        if (!db.objectStoreNames.contains('payments')) {
-          var p = db.createObjectStore('payments', { keyPath: 'id' });
-          p.createIndex('studentId', 'studentId', { unique: false });
-          p.createIndex('date', 'date', { unique: false });
-        }
-        if (!db.objectStoreNames.contains('notes')) {
-          var n = db.createObjectStore('notes', { keyPath: 'id' });
-          n.createIndex('classId', 'classId', { unique: false });
-          n.createIndex('studentId', 'studentId', { unique: false });
-          n.createIndex('date', 'date', { unique: false });
-        }
-        if (!db.objectStoreNames.contains('proofs')) {
-          var pr = db.createObjectStore('proofs', { keyPath: 'id' });
-          pr.createIndex('studentId', 'studentId', { unique: false });
-          pr.createIndex('status', 'status', { unique: false });
-          pr.createIndex('submissionId', 'submissionId', { unique: true });
-        }
-      };
+      req.onupgradeneeded = function (event) { upgrade(event.target.result); };
       req.onsuccess = function () {
         var db = req.result;
         db.onversionchange = function () { db.close(); };
@@ -84,7 +92,28 @@
       req.onerror = function () { reject(req.error || new Error('Could not open database')); };
       req.onblocked = function () { reject(new Error('Database is blocked by another tab')); };
     });
+  }
+
+  function open() {
+    if (!dbPromise) dbPromise = openNamed(DB_NAME);
     return dbPromise;
+  }
+
+  function useAccount(accountId) {
+    var id = String(accountId || '');
+    var nextName = accountDbName(id);
+    if (nextName === DB_NAME) {
+      activeAccountId = id;
+      return Promise.resolve(DB_NAME);
+    }
+    var previous = dbPromise;
+    dbPromise = null;
+    DB_NAME = nextName;
+    activeAccountId = id;
+    if (!previous) return Promise.resolve(DB_NAME);
+    return previous.then(function (db) {
+      try { db.close(); } catch (_) {}
+    }, function () {}).then(function () { return DB_NAME; });
   }
 
   function uid() {
@@ -186,6 +215,97 @@
     return getSettings().then(function (current) {
       var merged = Object.assign({}, current || { key: 'settings' }, patch, { key: 'settings', updatedAt: now() });
       return put('meta', merged).then(function () { return merged; });
+    });
+  }
+
+  function ensureSettings(user) {
+    var accountId = String(user && user.id || activeAccountId || '');
+    return getSettings().then(function (current) {
+      if (current && current.accountId === accountId) return current;
+      var lang = current && current.language === 'en' ? 'en' : (root.I18n && root.I18n.lang === 'en' ? 'en' : 'fa');
+      var next = Object.assign({}, current || {}, {
+        key: 'settings',
+        accountId: accountId,
+        username: String(user && user.username || current && current.username || ''),
+        language: lang,
+        theme: current && current.theme ? current.theme : 'auto',
+        setupComplete: true,
+        updatedAt: now()
+      });
+      return saveSettings(next);
+    });
+  }
+
+  function hasData() {
+    return Promise.all(DATA_STORES.map(function (store) { return getAll(store); })).then(function (lists) {
+      return lists.some(function (rows) { return rows.length > 0; });
+    });
+  }
+
+  function readLegacy() {
+    return openNamed(LEGACY_DB_NAME).then(function (db) {
+      return new Promise(function (resolve, reject) {
+        var t;
+        try {
+          t = db.transaction(ALL_STORES, 'readonly');
+        } catch (err) {
+          try { db.close(); } catch (_) {}
+          reject(err);
+          return;
+        }
+        var result = { settings: null, data: {}, counts: {}, hasData: false };
+        var pending = DATA_STORES.length + 1;
+        function done() {
+          pending--;
+          if (pending > 0) return;
+          try { db.close(); } catch (_) {}
+          result.hasData = DATA_STORES.some(function (store) { return result.counts[store] > 0; });
+          resolve(result);
+        }
+        var settingsReq = t.objectStore('meta').get('settings');
+        settingsReq.onsuccess = function () {
+          result.settings = settingsReq.result || null;
+          done();
+        };
+        settingsReq.onerror = function () { reject(settingsReq.error); };
+        DATA_STORES.forEach(function (store) {
+          var req = t.objectStore(store).getAll();
+          req.onsuccess = function () {
+            result.data[store] = req.result;
+            result.counts[store] = req.result.length;
+            done();
+          };
+          req.onerror = function () { reject(req.error); };
+        });
+        t.onerror = function () { reject(t.error); };
+      });
+    });
+  }
+
+  function importLegacy(user) {
+    return readLegacy().then(function (legacy) {
+      if (!legacy.hasData) return { imported: false, counts: legacy.counts };
+      var legacySettings = legacy.settings || {};
+      var payload = {
+        app: 'my-class',
+        schemaVersion: DB_VERSION,
+        exportedAt: now(),
+        settings: { language: legacySettings.language, theme: legacySettings.theme },
+        data: legacy.data
+      };
+      return importReplace(payload).then(function () {
+        var patch = {
+          accountId: String(user && user.id || activeAccountId || ''),
+          username: String(user && user.username || ''),
+          legacyImportedAt: now()
+        };
+        ['pinSalt', 'pinHash', 'pinIterations', 'pinVersion', 'teacherName', 'lastBackupAt'].forEach(function (key) {
+          if (legacySettings[key] != null) patch[key] = legacySettings[key];
+        });
+        return updateSettings(patch);
+      }).then(function (settings) {
+        return { imported: true, counts: legacy.counts, settings: settings };
+      });
     });
   }
 
@@ -407,6 +527,11 @@
       DATA_STORES.forEach(function (store) {
         t.objectStore(store).clear();
         (Array.isArray(payload.data[store]) ? payload.data[store] : []).forEach(function (record) {
+          if (store === 'students') {
+            record = Object.assign({}, record);
+            delete record.googleEmail;
+            delete record.portalEnabled;
+          }
           t.objectStore(store).put(record);
         });
       });
@@ -432,10 +557,14 @@
 
   root.DB = {
     DB_NAME: DB_NAME,
+    LEGACY_DB_NAME: LEGACY_DB_NAME,
     DB_VERSION: DB_VERSION,
     DATA_STORES: DATA_STORES,
     ALL_STORES: ALL_STORES,
     open: open,
+    dbName: function () { return DB_NAME; },
+    accountId: function () { return activeAccountId; },
+    useAccount: useAccount,
     uid: uid,
     now: now,
     get: get,
@@ -446,6 +575,10 @@
     getSettings: getSettings,
     saveSettings: saveSettings,
     updateSettings: updateSettings,
+    ensureSettings: ensureSettings,
+    hasData: hasData,
+    inspectLegacy: readLegacy,
+    importLegacy: importLegacy,
     loadData: loadData,
     sessionKey: sessionKey,
     getSessionByKey: getSessionByKey,

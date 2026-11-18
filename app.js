@@ -3,8 +3,10 @@
   'use strict';
 
   var Pages = window.Pages = window.Pages || {};
-  var APP_VERSION = '1.1.0';
+  var APP_VERSION = '2.0.0';
   var LOCK_KEY = 'my-class-lock-until';
+  var LANG_KEY = 'my-class-language-v2';
+  var LEGACY_CLAIM_KEY = 'my-class-legacy-claim-v2';
   var LOCK_MS = 30000;
   var MAX_ATTEMPTS = 5;
 
@@ -14,7 +16,7 @@
     data: null,
     billing: null,
     unlocked: false,
-    gateState: null,
+    staleAuth: false,
     route: null,
     currentPage: null,
     attState: null,
@@ -33,6 +35,7 @@
     lockError: '',
     wasOffline: false,
     swUpdateShown: false,
+    skipSyncOnce: false,
     eventsBound: false
   };
 
@@ -97,6 +100,10 @@
 
   App.lock = function () {
     if (!App.unlocked) return;
+    if (!App.settings || !App.settings.pinHash) {
+      UI.toast(t('settings.pinNotSet'), 'info');
+      return;
+    }
     App.unlocked = false;
     App.data = null;
     App.billing = null;
@@ -178,28 +185,47 @@
 
   function boot() {
     I18n.apply();
+    I18n.setLanguage(readLanguage());
     UI.applyTheme('auto');
     bindGlobalEvents();
     registerSW();
     updateNetBanner();
-    DB.open().then(function () {
-      return DB.getSettings();
+    var auth = window.Auth ? Auth.status() : { hasSession: false, valid: false, expired: false, user: null };
+    if (!auth.hasSession) {
+      showLogin();
+      return;
+    }
+    if (auth.expired && navigator.onLine) {
+      Auth.clear();
+      showLogin('auth.sessionExpired');
+      return;
+    }
+    if (auth.expired) App.staleAuth = true;
+    DB.useAccount(auth.user.id).then(function () {
+      return DB.ensureSettings(auth.user);
     }).then(function (settings) {
-      App.settings = settings || null;
-      if (!settings || !settings.setupComplete || !settings.pinHash) {
-        var lang = settings && settings.language === 'en' ? 'en' : 'fa';
-        I18n.setLanguage(lang);
-        UI.applyTheme(settings && settings.theme ? settings.theme : 'auto');
-        showSetup(lang);
-      } else {
-        I18n.setLanguage(settings.language === 'en' ? 'en' : 'fa');
-        UI.applyTheme(settings.theme || 'auto');
-        showLock();
-      }
+      App.settings = settings;
+      I18n.setLanguage(settings.language === 'en' ? 'en' : 'fa');
+      UI.applyTheme(settings.theme || 'auto');
+      if (settings.pinHash) showLock();
+      else enterApp();
     }).catch(function (err) {
       console.error(err);
       showGateError(err);
     });
+  }
+
+  function readLanguage() {
+    try {
+      return localStorage.getItem(LANG_KEY) === 'en' ? 'en' : 'fa';
+    } catch (_) {
+      return 'fa';
+    }
+  }
+
+  function persistLanguage(lang) {
+    I18n.setLanguage(lang);
+    try { localStorage.setItem(LANG_KEY, I18n.lang); } catch (_) {}
   }
 
   function showGateError(err) {
@@ -219,128 +245,138 @@
     if (retry) retry.addEventListener('click', function () { location.reload(); });
   }
 
-  function showSetup(lang) {
+  function showLogin(messageKey) {
     App.unlocked = false;
     App.data = null;
     App.billing = null;
+    App.staleAuth = false;
     if (App.attState) App.attState.draft = null;
-    App.gateState = { step: 'language', lang: lang === 'en' ? 'en' : 'fa' };
-    I18n.setLanguage(App.gateState.lang);
-    UI.applyTheme(App.settings && App.settings.theme ? App.settings.theme : 'auto');
+    if (window.Sync) Sync.reset();
     closeDialogs();
     clearShell();
     var gate = document.getElementById('gate');
     var app = document.getElementById('app');
     gate.hidden = false;
     app.hidden = true;
-    renderSetup();
+    renderLogin(messageKey);
   }
 
-  App.showSetup = showSetup;
+  function loginErrorKey(err) {
+    if (!err) return 'auth.loginFailed';
+    if (err.code === 'AUTH_FAILED' || err.code === 'INVALID_CREDENTIALS') return 'auth.loginFailed';
+    if (err.code === 'AUTH_LOCKED') return 'auth.locked';
+    if (err.code === 'TEACHER_ONLY') return 'auth.teacherOnly';
+    if (err.code === 'NOT_CONFIGURED') return 'auth.backendMissing';
+    if (err.code === 'NETWORK_ERROR' || err.code === 'TIMEOUT' || err.code === 'OFFLINE') return 'auth.networkError';
+    return 'auth.loginFailed';
+  }
 
-  function renderSetup() {
+  function renderLogin(messageKey) {
     var gate = document.getElementById('gate');
-    var state = App.gateState || { step: 'language', lang: 'fa' };
-    if (state.step === 'language') {
-      gate.innerHTML = '<div class="gate-card">' +
-        '<div class="brand-mark">' + UI.icon('book', 34) + '</div>' +
-        '<p class="eyebrow">' + esc(t('app.tagline')) + '</p>' +
-        '<h1>' + esc(t('gate.welcome')) + '</h1>' +
-        '<p class="gate-sub">' + esc(t('gate.subtitle')) + '</p>' +
-        '<h2 class="gate-section-title">' + esc(t('gate.chooseLanguage')) + '</h2>' +
-        '<div class="language-choice">' +
-          '<button type="button" class="language-btn' + (state.lang === 'fa' ? ' is-active' : '') + '" data-lang="fa">' +
-            '<strong>فارسی</strong><small>راست‌به‌چپ</small></button>' +
-          '<button type="button" class="language-btn' + (state.lang === 'en' ? ' is-active' : '') + '" data-lang="en">' +
-            '<strong>English</strong><small>Left to right</small></button>' +
-        '</div>' +
-        '<p class="hint">' + esc(t('gate.languageHint')) + '</p>' +
-        '<button type="button" class="btn primary btn-block" data-continue>' + esc(t('gate.continue')) + '</button>' +
-      '</div>';
-      gate.querySelectorAll('[data-lang]').forEach(function (b) {
-        b.addEventListener('click', function () {
-          App.gateState.lang = b.getAttribute('data-lang');
-          I18n.setLanguage(App.gateState.lang);
-          renderSetup();
-        });
-      });
-      gate.querySelector('[data-continue]').addEventListener('click', function () {
-        App.gateState.step = 'pin';
-        renderSetup();
-      });
-      return;
-    }
-
+    var backendReady = !!(window.Api && Api.isConfigured());
+    var offline = !navigator.onLine;
+    var notice = messageKey ? t(messageKey) : '';
     gate.innerHTML = '<div class="gate-card">' +
       '<div class="brand-mark">' + UI.icon('book', 34) + '</div>' +
-      '<p class="eyebrow">' + esc(t('app.name')) + '</p>' +
-      '<h1>' + esc(t('gate.pinTitle')) + '</h1>' +
-      '<p class="gate-sub">' + esc(t('gate.pinSubtitle')) + '</p>' +
-      '<form class="gate-form" novalidate>' +
-        '<label class="field"><span>' + esc(t('gate.pinLabel')) + '</span>' +
-          '<input class="input pin-input" name="pin" type="password" inputmode="numeric" pattern="[0-9۰-۹]{4,6}" maxlength="6" autocomplete="new-password" required></label>' +
-        '<label class="field"><span>' + esc(t('gate.pinConfirm')) + '</span>' +
-          '<input class="input pin-input" name="pin2" type="password" inputmode="numeric" pattern="[0-9۰-۹]{4,6}" maxlength="6" autocomplete="new-password" required></label>' +
-        '<p class="form-error" role="alert" hidden></p>' +
-        '<button type="submit" class="btn primary btn-block">' + esc(t('gate.pinCreate')) + '</button>' +
+      '<p class="eyebrow">' + esc(t('app.tagline')) + '</p>' +
+      '<h1>' + esc(t('auth.title')) + '</h1>' +
+      '<p class="gate-sub">' + esc(t('auth.subtitle')) + '</p>' +
+      '<form class="gate-form login-form" novalidate>' +
+        '<label class="field"><span>' + esc(t('auth.username')) + '</span>' +
+          '<input class="input" name="username" dir="ltr" autocomplete="username" autocapitalize="none" spellcheck="false" required></label>' +
+        '<label class="field"><span>' + esc(t('auth.password')) + '</span>' +
+          '<input class="input" name="password" type="password" dir="ltr" autocomplete="current-password" required></label>' +
+        '<p class="form-error" role="alert"' + (notice ? '' : ' hidden') + '>' + esc(notice) + '</p>' +
+        '<button type="submit" class="btn primary btn-block"' + (backendReady ? '' : ' disabled') + '>' + esc(t('auth.signIn')) + '</button>' +
       '</form>' +
-      '<p class="gate-warning">' + UI.icon('alert', 16) + ' ' + esc(t('gate.pinWarning')) + '</p>' +
-      '<button type="button" class="link-btn" data-back-language>' + esc(t('gate.changeLanguage')) + '</button>' +
+      (!backendReady ? '<p class="hint hint-warn">' + esc(t('auth.backendMissing')) + '</p>' : '') +
+      (offline ? '<p class="hint hint-warn">' + esc(t('auth.offline')) + '</p>' : '') +
+      '<button type="button" class="link-btn" data-login-language>' + esc(I18n.lang === 'fa' ? 'English' : 'فارسی') + '</button>' +
     '</div>';
 
-    var form = gate.querySelector('.gate-form');
+    var form = gate.querySelector('.login-form');
     var errorEl = gate.querySelector('.form-error');
     var submitBtn = form.querySelector('button[type="submit"]');
-    gate.querySelector('[data-back-language]').addEventListener('click', function () {
-      App.gateState.step = 'language';
-      renderSetup();
+    gate.querySelector('[data-login-language]').addEventListener('click', function () {
+      persistLanguage(I18n.lang === 'fa' ? 'en' : 'fa');
+      renderLogin(messageKey);
     });
     form.addEventListener('submit', async function (e) {
       e.preventDefault();
       errorEl.hidden = true;
       var fd = new FormData(form);
-      var pin = String(fd.get('pin') || '');
-      var pin2 = String(fd.get('pin2') || '');
-      if (!Pin.isValid(pin)) {
-        errorEl.textContent = t('validation.pinLength');
-        errorEl.hidden = false;
-        return;
-      }
-      if (Pin.normalize(pin) !== Pin.normalize(pin2)) {
-        errorEl.textContent = t('validation.pinMismatch');
-        errorEl.hidden = false;
-        return;
-      }
-      if (!Pin.isSupported()) {
-        errorEl.textContent = t('gate.cryptoUnavailable');
+      var username = String(fd.get('username') || '').trim();
+      var password = String(fd.get('password') || '');
+      if (!username || !password) {
+        errorEl.textContent = t('auth.credentialsRequired');
         errorEl.hidden = false;
         return;
       }
       submitBtn.disabled = true;
+      submitBtn.textContent = t('auth.signingIn');
+      if (window.Auth) Auth.clear();
       try {
-        var record = await Pin.create(pin);
-        var saved = await DB.saveSettings(Object.assign({
-          key: 'settings',
-          language: App.gateState.lang,
-          theme: 'auto',
-          setupComplete: true,
-          createdAt: DB.now(),
-          lastBackupAt: null
-        }, record));
-        App.settings = saved;
+        var session = await Auth.login(username, password);
+        App.staleAuth = false;
+        await DB.useAccount(session.user.id);
+        var settings = await DB.ensureSettings(session.user);
+        persistLanguage(settings.language === 'en' ? 'en' : 'fa');
+        UI.applyTheme(settings.theme || 'auto');
+        await adoptLegacyData(session.user);
+        App.settings = await DB.getSettings();
         await enterApp();
       } catch (err) {
         console.error(err);
-        errorEl.textContent = err && err.userMessage ? err.userMessage : t('error.generic');
-        errorEl.hidden = false;
-        submitBtn.disabled = false;
+        renderLogin(loginErrorKey(err));
       }
     });
     setTimeout(function () {
-      var input = gate.querySelector('input[name="pin"]');
+      var input = gate.querySelector('input[name="username"]');
       if (input) input.focus();
     }, 60);
   }
+
+  function legacyClaim() {
+    try {
+      var raw = localStorage.getItem(LEGACY_CLAIM_KEY);
+      return raw ? JSON.parse(raw) : null;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  async function adoptLegacyData(user) {
+    if (legacyClaim()) return;
+    var legacy;
+    try {
+      legacy = await DB.inspectLegacy();
+    } catch (err) {
+      console.error(err);
+      return;
+    }
+    if (!legacy || !legacy.hasData) return;
+    var ok = await UI.confirm({
+      title: t('auth.legacyTitle'),
+      message: t('auth.legacyMessage'),
+      confirmLabel: t('auth.legacyImport'),
+      cancelLabel: t('auth.legacySkip')
+    });
+    if (ok) {
+      try {
+        await DB.importLegacy(user);
+        UI.toast(t('auth.legacyImported'), 'success');
+      } catch (err) {
+        console.error(err);
+        UI.alert({ title: t('auth.legacyTitle'), message: t('error.generic') });
+        return;
+      }
+    }
+    try {
+      localStorage.setItem(LEGACY_CLAIM_KEY, JSON.stringify({ accountId: user.id, at: DB.now(), imported: !!ok }));
+    } catch (_) {}
+  }
+
+  App.showLogin = showLogin;
 
   function showLock() {
     clearLockTimer();
@@ -437,7 +473,6 @@
     try {
       clearLockTimer();
       App.unlocked = true;
-      App.gateState = null;
       App.lockError = '';
       document.getElementById('gate').hidden = true;
       document.getElementById('app').hidden = false;
@@ -447,10 +482,62 @@
         history.replaceState(null, '', '#/home');
       }
       App.render();
+      startSyncAfterLogin();
     } catch (err) {
       console.error(err);
       App.unlocked = false;
       showGateError(err);
+    }
+  }
+
+  async function startSyncAfterLogin() {
+    if (!window.Sync || !window.Auth || !Auth.valid() || !navigator.onLine) return;
+    if (!window.Api || !Api.isConfigured()) return;
+    if (App.skipSyncOnce) {
+      App.skipSyncOnce = false;
+      return;
+    }
+    try {
+      var result = await Sync.start();
+      if (result && result.needsChoice) {
+        await promptInitialSync(result);
+        return;
+      }
+      if (result && (result.mode === 'pulled' || result.mode === 'pushed')) {
+        await App.reloadData();
+        App.render();
+      }
+      if (result && result.receipts) {
+        UI.toast(t('cloud.receiptsImported', { count: Fmt.formatNumber(result.receipts, I18n.lang) }), 'success');
+      }
+    } catch (err) {
+      if (err && ['NOT_CONFIGURED', 'OFFLINE', 'AUTH_REQUIRED', 'AUTH_EXPIRED', 'ACCOUNT_DISABLED'].indexOf(err.code) >= 0) return;
+      if (err && err.code === 'SYNC_CONFLICT') {
+        UI.toast(t('cloud.syncPending'), 'info', 4500);
+        return;
+      }
+      console.error(err);
+    }
+  }
+
+  async function promptInitialSync(result) {
+    var choice = await UI.dialog({
+      title: t('cloud.remoteFound'),
+      body: '<p class="hint">' + esc(t('cloud.remoteHint')) + '</p><p class="hint">' + esc(t('cloud.localHint')) + '</p>' +
+        (result.remoteCounts ? '<p class="hint">' + esc(t('cloud.remoteCount', { count: Fmt.formatNumber(result.remoteCounts.students || 0, I18n.lang) })) + '</p>' : ''),
+      actions: [
+        { label: t('cloud.useRemote'), value: 'remote', variant: 'primary' },
+        { label: t('cloud.useLocal'), value: 'local', variant: 'ghost' }
+      ]
+    });
+    if (!choice) return;
+    try {
+      await Sync.applyChoice(choice);
+      await App.reloadData();
+      App.render();
+      UI.toast(choice === 'remote' ? t('cloud.pullSuccess') : t('cloud.pushSuccess'), 'success');
+    } catch (err) {
+      showCloudError(err);
     }
   }
 
@@ -486,6 +573,8 @@
       return { page: 'classDetail', nav: 'more', params: { id: s[1] } };
     }
     if (s[0] === 'notes') return { page: 'notesPage', nav: 'more', params: {} };
+    if (s[0] === 'accounts') return { page: 'accounts', nav: 'more', params: {} };
+    if (s[0] === 'admin') return { page: 'admin', nav: 'more', params: {} };
     if (s[0] === 'settings') return { page: 'settings', nav: 'more', params: {} };
     return { page: 'notFound', nav: 'home', params: {} };
   }
@@ -536,9 +625,10 @@
     var back = page.back
       ? '<button type="button" class="icon-btn header-back" data-back aria-label="' + esc(t('common.back')) + '">' + UI.icon('back', 22) + '</button>'
       : '<span class="header-slot" aria-hidden="true"></span>';
+    var canLock = !!(App.settings && App.settings.pinHash);
     header.innerHTML = back +
       '<div class="header-title"><span class="header-kicker">' + esc(t('app.name')) + '</span><h1>' + esc(page.title || t('app.name')) + '</h1></div>' +
-      '<button type="button" class="icon-btn header-lock" data-lock aria-label="' + esc(t('gate.lock')) + '">' + UI.icon('lock', 20) + '</button>';
+      (canLock ? '<button type="button" class="icon-btn header-lock" data-lock aria-label="' + esc(t('gate.lock')) + '">' + UI.icon('lock', 20) + '</button>' : '<span class="header-slot" aria-hidden="true"></span>');
     var backBtn = header.querySelector('[data-back]');
     if (backBtn) backBtn.addEventListener('click', function () { App.navigate(page.back); });
     var lockBtn = header.querySelector('[data-lock]');
@@ -737,6 +827,11 @@
   Pages.more = function () {
     var classCount = App.data.classes.filter(function (c) { return !c.archived; }).length;
     var noteCount = App.data.notes.length;
+    var lockRow = App.settings && App.settings.pinHash
+      ? '<button type="button" class="menu-row" data-lock-now><span class="menu-icon">' + UI.icon('lock', 21) + '</span>' +
+          '<span class="row-main"><span class="row-title">' + esc(t('settings.lockNow')) + '</span><span class="row-sub">' + esc(t('settings.pinSameSession')) + '</span></span>' +
+          UI.icon('chevron-left', 18, 'row-chevron') + '</button>'
+      : '';
     return {
       title: t('nav.more'),
       nav: 'more',
@@ -763,9 +858,7 @@
             '<button type="button" class="menu-row" data-install><span class="menu-icon">' + UI.icon('install', 21) + '</span>' +
               '<span class="row-main"><span class="row-title">' + esc(t('settings.installTitle')) + '</span><span class="row-sub">' + esc(t('settings.installHint')) + '</span></span>' +
               UI.icon('chevron-left', 18, 'row-chevron') + '</button>' +
-            '<button type="button" class="menu-row" data-lock-now><span class="menu-icon">' + UI.icon('lock', 21) + '</span>' +
-              '<span class="row-main"><span class="row-title">' + esc(t('settings.lockNow')) + '</span><span class="row-sub">' + esc(t('settings.pinSameSession')) + '</span></span>' +
-              UI.icon('chevron-left', 18, 'row-chevron') + '</button>' +
+            lockRow +
           '</div>' +
         '</section>' +
         '<section class="card about-card">' +
@@ -798,19 +891,25 @@
     var lang = I18n.lang;
     var theme = settings.theme || 'auto';
     var sync = window.Sync ? Sync.status() : null;
+    var authUser = (sync && sync.user) || (window.Auth && Auth.user()) || null;
+    var isOwner = !!(authUser && authUser.role === 'owner');
     var cloudConfigured = !!(sync && sync.configured);
-    var cloudConnected = !!(sync && sync.meta && sync.meta.connected);
     var cloudAuthenticated = !!(sync && sync.authenticated);
-    var cloudEmail = (sync && (sync.meta.email || sync.email)) || '';
+    var cloudExpired = !!(sync && sync.expired);
+    var cloudInitialized = !!(sync && sync.initialized);
     var cloudLastSync = sync && sync.meta.lastSyncedAt ? dateFromTimestamp(sync.meta.lastSyncedAt) : t('cloud.never');
-    var cloudFolder = sync && sync.meta.folderId ? 'https://drive.google.com/drive/folders/' + encodeURIComponent(sync.meta.folderId) : '';
-    var cloudMissing = (sync && sync.missing) || [];
     var pendingProofs = window.Sync && Sync.pendingProofs ? Sync.pendingProofs().length : 0;
-    var cloudPortals = sync && sync.meta && sync.meta.portals ? Object.keys(sync.meta.portals).filter(function (id) {
-      var entry = sync.meta.portals[id];
-      return !!(entry && entry.sharedEmail);
-    }).length : 0;
+    var cloudPortals = 0;
+    if (sync && sync.meta && sync.meta.portals && App.data) {
+      App.data.students.forEach(function (student) {
+        if (!student.archived && sync.meta.portals[student.id]) cloudPortals++;
+      });
+    }
     var cloudError = (sync && (sync.lastError || (sync.meta && sync.meta.lastError))) || '';
+    var cloudAuto = !!(sync && sync.meta && sync.meta.autoSync);
+    var accountName = authUser ? (authUser.displayName || authUser.username) : '';
+    var accountRole = authUser ? t(authUser.role === 'owner' ? 'auth.roleOwner' : 'auth.roleTeacher') : '';
+    var pinEnabled = !!settings.pinHash;
     return {
       title: t('settings.title'),
       back: '#/more',
@@ -837,31 +936,33 @@
 
         '<section class="card settings-section cloud-section">' +
           '<div class="section-head"><h3>' + UI.icon('cloud', 19) + ' ' + esc(t('cloud.title')) + '</h3>' +
-            (cloudConnected ? UI.badge(t('cloud.connectedBadge'), 'success') : UI.badge(t('cloud.disconnected'), 'neutral')) + '</div>' +
+            (cloudAuthenticated ? UI.badge(t('cloud.connectedBadge'), 'success') :
+              cloudExpired ? UI.badge(t('cloud.expiredBadge'), 'amber') : UI.badge(t('cloud.disconnected'), 'neutral')) + '</div>' +
           '<p class="hint">' + esc(t('cloud.subtitle')) + '</p>' +
-          (!cloudConfigured
-            ? '<p class="hint hint-warn">' + esc(t('cloud.notConfigured')) + '</p>' +
-              (cloudMissing.length ? '<p class="hint">' + esc(t('cloud.configMissing', { fields: cloudMissing.join(', ') })) + '</p>' : '') +
-              '<p class="hint">' + esc(t('cloud.setupHint')) + '</p>'
-            : '<div class="cloud-status">' +
-                '<span class="cloud-dot' + (cloudConnected && cloudAuthenticated ? ' is-online' : '') + '"></span>' +
-                '<strong>' + esc(cloudConnected ? (cloudEmail ? t('cloud.connectedAs', { email: cloudEmail }) : t('cloud.connectedNeedsAuth')) : t('cloud.ready')) + '</strong>' +
-              '</div>' +
-              '<p class="hint">' + esc(t('cloud.lastSync', { date: cloudLastSync })) + '</p>' +
-              (cloudConnected && cloudPortals ? '<p class="hint">' + esc(t('cloud.portalCount', { count: Fmt.formatNumber(cloudPortals, I18n.lang) })) + '</p>' : '') +
-              (cloudConnected ? '<p class="hint">' + esc(t('cloud.shareHint')) + '</p>' : '') +
-              (pendingProofs ? '<p class="hint hint-warn">' + esc(t('cloud.proofsPending', { count: Fmt.formatNumber(pendingProofs, I18n.lang) })) + '</p>' : '')) +
+          (accountName ? '<div class="cloud-status">' +
+              '<span class="cloud-dot' + (cloudAuthenticated && sync && sync.online ? ' is-online' : '') + '"></span>' +
+              '<strong>' + esc(t('cloud.connectedAs', { username: accountName })) + '</strong>' +
+            '</div>' +
+            '<p class="hint">' + esc(t('auth.accountRole', { role: accountRole })) + '</p>' : '') +
+          (!cloudConfigured ? '<p class="hint hint-warn">' + esc(t('cloud.notConfigured')) + '</p>' + '<p class="hint">' + esc(t('cloud.setupHint')) + '</p>' : '') +
+          (cloudExpired ? '<p class="hint hint-warn">' + esc(t('auth.sessionExpired')) + '</p>' : '') +
+          (sync && !sync.online ? '<p class="hint hint-warn">' + esc(t('auth.offline')) + '</p>' : '') +
+          (cloudAuthenticated && cloudInitialized
+            ? '<p class="hint">' + esc(t('cloud.lastSync', { date: cloudLastSync })) + '</p>' +
+              '<p class="hint">' + esc(t('cloud.portalCount', { count: Fmt.formatNumber(cloudPortals, I18n.lang) })) + '</p>'
+            : cloudAuthenticated ? '<p class="hint">' + esc(t('cloud.firstSync')) + '</p>' : '') +
+          (cloudAuthenticated ? '<p class="hint">' + esc(t('cloud.shareHint')) + '</p>' : '') +
+          (pendingProofs ? '<p class="hint hint-warn">' + esc(t('cloud.proofsPending', { count: Fmt.formatNumber(pendingProofs, I18n.lang) })) + '</p>' : '') +
           (cloudError ? '<p class="hint hint-warn">' + esc(t('cloud.error')) + ': ' + esc(cloudError) + '</p>' : '') +
-          '<label class="switch-row"><input type="checkbox" data-cloud-auto' + (sync && sync.meta && sync.meta.autoSync ? ' checked' : '') + (cloudConnected ? '' : ' disabled') + '><span>' + esc(t('cloud.autoSync')) + '</span></label>' +
+          '<label class="switch-row"><input type="checkbox" data-cloud-auto' + (cloudAuto ? ' checked' : '') + (cloudAuthenticated ? '' : ' disabled') + '><span>' + esc(t('cloud.autoSync')) + '</span></label>' +
           '<p class="hint">' + esc(t('cloud.autoSyncHint')) + '</p>' +
           '<div class="settings-actions">' +
-            '<button type="button" class="btn primary" data-cloud-connect' + (cloudConfigured ? '' : ' disabled') + '>' + UI.icon('cloud', 17) + ' ' + esc(cloudConnected ? t('cloud.reconnect') : t('cloud.connect')) + '</button>' +
-            '<button type="button" class="btn ghost" data-cloud-sync' + (cloudConnected ? '' : ' disabled') + '>' + UI.icon('refresh', 17) + ' ' + esc(t('cloud.syncNow')) + '</button>' +
-            '<button type="button" class="btn ghost" data-cloud-publish' + (cloudConnected ? '' : ' disabled') + '>' + UI.icon('upload', 17) + ' ' + esc(t('cloud.publish')) + '</button>' +
-            (cloudConnected ? '<button type="button" class="btn ghost danger-text" data-cloud-disconnect>' + UI.icon('x', 17) + ' ' + esc(t('cloud.disconnect')) + '</button>' : '') +
-            (cloudFolder ? '<a class="btn ghost" href="' + esc(cloudFolder) + '" target="_blank" rel="noopener">' + UI.icon('drive', 17) + ' ' + esc(t('cloud.openDrive')) + '</a>' : '') +
+            (cloudExpired ? '<button type="button" class="btn primary" data-account-signin>' + UI.icon('user', 17) + ' ' + esc(t('auth.reSignIn')) + '</button>' : '') +
+            '<button type="button" class="btn primary" data-account-sync' + (cloudAuthenticated ? '' : ' disabled') + '>' + UI.icon('refresh', 17) + ' ' + esc(t('cloud.syncNow')) + '</button>' +
+            '<button type="button" class="btn ghost" data-account-publish' + (cloudAuthenticated ? '' : ' disabled') + '>' + UI.icon('upload', 17) + ' ' + esc(t('cloud.publish')) + '</button>' +
+            '<button type="button" class="btn ghost danger-text" data-account-signout>' + UI.icon('logout', 17) + ' ' + esc(t('auth.signOut')) + '</button>' +
           '</div>' +
-          '<p class="hint">' + esc(t('cloud.driveScopeHint')) + '</p>' +
+          '<p class="hint">' + esc(t('cloud.serverHint')) + '</p>' +
         '</section>' +
 
         '<section class="card settings-section">' +
@@ -874,13 +975,25 @@
         '</section>' +
 
         '<section class="card settings-section">' +
-          '<div class="section-head"><h3>' + UI.icon('lock', 19) + ' ' + esc(t('settings.securitySection')) + '</h3></div>' +
+          '<div class="section-head"><h3>' + UI.icon('users', 19) + ' ' + esc(t('accounts.title')) + '</h3></div>' +
+          '<p class="hint">' + esc(t('accounts.settingsHint')) + '</p>' +
           '<div class="settings-actions">' +
-            '<button type="button" class="btn ghost" data-change-pin>' + UI.icon('lock', 17) + ' ' + esc(t('settings.changePin')) + '</button>' +
-            '<button type="button" class="btn ghost" data-lock-now>' + UI.icon('lock', 17) + ' ' + esc(t('settings.lockNow')) + '</button>' +
+            '<button type="button" class="btn ghost" data-go-accounts>' + UI.icon('users', 17) + ' ' + esc(t('accounts.open')) + '</button>' +
+            (isOwner ? '<button type="button" class="btn ghost" data-go-admin>' + UI.icon('user', 17) + ' ' + esc(t('accounts.adminOpen')) + '</button>' : '') +
           '</div>' +
-          '<p class="hint">' + esc(t('settings.pinSameSession')) + '</p>' +
-          '<p class="hint hint-warn">' + esc(t('settings.pinWarning')) + '</p>' +
+        '</section>' +
+
+        '<section class="card settings-section">' +
+          '<div class="section-head"><h3>' + UI.icon('lock', 19) + ' ' + esc(t('settings.securitySection')) + '</h3></div>' +
+          '<p class="hint">' + esc(t('settings.pinOptional')) + '</p>' +
+          '<div class="settings-actions">' +
+            (pinEnabled
+              ? '<button type="button" class="btn ghost" data-change-pin>' + UI.icon('lock', 17) + ' ' + esc(t('settings.changePin')) + '</button>' +
+                '<button type="button" class="btn ghost" data-lock-now>' + UI.icon('lock', 17) + ' ' + esc(t('settings.lockNow')) + '</button>' +
+                '<button type="button" class="btn ghost danger-text" data-remove-pin>' + UI.icon('unlock', 17) + ' ' + esc(t('settings.removePin')) + '</button>'
+              : '<button type="button" class="btn ghost" data-set-pin>' + UI.icon('lock', 17) + ' ' + esc(t('settings.setPin')) + '</button>') +
+          '</div>' +
+          (pinEnabled ? '<p class="hint hint-warn">' + esc(t('settings.pinWarning')) + '</p>' : '') +
         '</section>' +
 
         '<section class="card settings-section">' +
@@ -956,17 +1069,20 @@
             App.rerender();
           });
         });
-        view.querySelectorAll('[data-cloud-connect]').forEach(function (b) {
-          b.addEventListener('click', function () { connectDrive(); });
+        view.querySelectorAll('[data-account-sync]').forEach(function (b) {
+          b.addEventListener('click', function () { syncAccount(); });
         });
-        view.querySelectorAll('[data-cloud-sync]').forEach(function (b) {
-          b.addEventListener('click', function () { syncDrive(); });
+        view.querySelectorAll('[data-account-publish]').forEach(function (b) {
+          b.addEventListener('click', function () { publishPortals(); });
         });
-        view.querySelectorAll('[data-cloud-publish]').forEach(function (b) {
-          b.addEventListener('click', function () { publishDrive(); });
+        view.querySelectorAll('[data-account-signin]').forEach(function (b) {
+          b.addEventListener('click', function () {
+            if (window.Auth) Auth.clear();
+            showLogin('auth.sessionExpired');
+          });
         });
-        view.querySelectorAll('[data-cloud-disconnect]').forEach(function (b) {
-          b.addEventListener('click', function () { disconnectDrive(); });
+        view.querySelectorAll('[data-account-signout]').forEach(function (b) {
+          b.addEventListener('click', function () { signOut(); });
         });
         var cloudAuto = view.querySelector('[data-cloud-auto]');
         if (cloudAuto) cloudAuto.addEventListener('change', async function () {
@@ -985,8 +1101,20 @@
         view.querySelectorAll('[data-go-notes]').forEach(function (b) {
           b.addEventListener('click', function () { App.navigate('#/notes'); });
         });
+        view.querySelectorAll('[data-go-accounts]').forEach(function (b) {
+          b.addEventListener('click', function () { App.navigate('#/accounts'); });
+        });
+        view.querySelectorAll('[data-go-admin]').forEach(function (b) {
+          b.addEventListener('click', function () { App.navigate('#/admin'); });
+        });
         view.querySelectorAll('[data-change-pin]').forEach(function (b) {
           b.addEventListener('click', function () { openChangePinDialog(); });
+        });
+        view.querySelectorAll('[data-set-pin]').forEach(function (b) {
+          b.addEventListener('click', function () { openSetPinDialog(); });
+        });
+        view.querySelectorAll('[data-remove-pin]').forEach(function (b) {
+          b.addEventListener('click', function () { openRemovePinDialog(); });
         });
         view.querySelectorAll('[data-lock-now]').forEach(function (b) {
           b.addEventListener('click', async function () {
@@ -1051,58 +1179,40 @@
   function cloudErrorKey(err) {
     if (!err) return 'cloud.error';
     if (err.code === 'NOT_CONFIGURED') return 'cloud.notConfigured';
-    if (err.code === 'AUTH_REQUIRED' || err.code === 'AUTH_FAILED') return 'cloud.authRequired';
-    if (err.code === 'NO_EMAIL') return 'cloud.noEmail';
+    if (err.code === 'AUTH_REQUIRED' || err.code === 'AUTH_EXPIRED' || err.code === 'ACCOUNT_DISABLED') return 'cloud.authRequired';
+    if (err.code === 'OFFLINE' || err.code === 'NETWORK_ERROR' || err.code === 'TIMEOUT') return 'auth.offline';
     if (err.code === 'SYNC_CONFLICT') return 'cloud.conflict';
     return 'cloud.error';
   }
 
   function showCloudError(err) {
     console.error(err);
+    if (err && (err.code === 'AUTH_REQUIRED' || err.code === 'AUTH_EXPIRED' || err.code === 'ACCOUNT_DISABLED')) {
+      Auth.clear();
+      showLogin('auth.sessionExpired');
+      return;
+    }
     var key = cloudErrorKey(err);
     var message = t(key);
     if (key === 'cloud.error' && err && err.message) message += '\n' + err.message;
     UI.alert({ title: t('cloud.error'), message: message });
   }
 
-  async function connectDrive() {
+  async function syncAccount() {
     if (!window.Sync) return;
     try {
-      var result = await Sync.connect();
+      var result = await Sync.syncNow();
       if (result && result.needsChoice) {
-        var choice = await UI.dialog({
-          title: t('cloud.remoteFound'),
-          message: '',
-          body: '<p class="hint">' + esc(t('cloud.remoteHint')) + '</p><p class="hint">' + esc(t('cloud.localHint')) + '</p>',
-          actions: [
-            { label: t('cloud.useRemote'), value: 'remote', variant: 'primary' },
-            { label: t('cloud.useLocal'), value: 'local', variant: 'ghost' }
-          ]
-        });
-        if (!choice) return;
-        await Sync.connect({ strategy: choice });
-        UI.toast(choice === 'remote' ? t('cloud.pullSuccess') : t('cloud.pushSuccess'), 'success');
-      } else {
-        UI.toast(t('cloud.connected'), 'success');
+        await promptInitialSync(result);
+        return;
       }
       await App.reloadData();
       App.rerender();
-    } catch (err) {
-      showCloudError(err);
-    }
-  }
-
-  async function syncDrive() {
-    if (!window.Sync) return;
-    try {
-      var result = await Sync.syncNow({ interactive: true });
-      if (result && result.mode === 'inbox' && result.count) {
-        UI.toast(t('cloud.inboxRead', { count: Fmt.formatNumber(result.count, I18n.lang) }), 'success');
+      if (result && result.receipts) {
+        UI.toast(t('cloud.receiptsImported', { count: Fmt.formatNumber(result.receipts, I18n.lang) }), 'success');
       } else {
         UI.toast(t('cloud.syncSuccess'), 'success');
       }
-      await App.reloadData();
-      App.rerender();
     } catch (err) {
       if (err && err.code === 'SYNC_CONFLICT') {
         var choice = await UI.dialog({
@@ -1116,10 +1226,7 @@
         if (!choice) return;
         try {
           if (choice === 'pull') await Sync.pull();
-          else {
-            await Sync.push(true);
-            await Sync.publishPortals();
-          }
+          else await Sync.push(true);
           await App.reloadData();
           UI.toast(choice === 'pull' ? t('cloud.pullSuccess') : t('cloud.pushSuccess'), 'success');
           App.rerender();
@@ -1132,10 +1239,14 @@
     }
   }
 
-  async function publishDrive() {
+  async function publishPortals() {
     if (!window.Sync) return;
     try {
-      var result = await Sync.publishPortals({ interactive: true });
+      var result = await Sync.publishPortals();
+      if (result && result.needsChoice) {
+        await promptInitialSync(result);
+        return;
+      }
       await App.reloadData();
       UI.toast(t('cloud.publishSuccess') + (result && result.published ? ' · ' + Fmt.formatNumber(result.published, I18n.lang) : ''), 'success');
       App.rerender();
@@ -1144,22 +1255,24 @@
     }
   }
 
-  async function disconnectDrive() {
-    if (!window.Sync) return;
+  async function signOut() {
+    if (!window.Auth) return;
     var ok = await UI.confirm({
-      title: t('cloud.disconnect'),
-      message: t('cloud.disconnectConfirm'),
-      confirmLabel: t('cloud.disconnect'),
+      title: t('auth.signOut'),
+      message: t('auth.signOutConfirm'),
+      confirmLabel: t('auth.signOut'),
       danger: true
     });
     if (!ok) return;
     try {
-      await Sync.disconnect();
-      UI.toast(t('cloud.disconnectedToast'), 'success');
-      App.rerender();
-    } catch (err) {
-      showCloudError(err);
-    }
+      await Auth.logout();
+    } catch (_) {}
+    if (window.Sync) Sync.reset();
+    await DB.useAccount(null);
+    App.settings = null;
+    App.data = null;
+    App.billing = null;
+    showLogin('auth.signedOut');
   }
 
   function openChangePinDialog() {
@@ -1186,6 +1299,61 @@
         var record = await Pin.create(next);
         App.settings = await DB.updateSettings(record);
         UI.toast(t('settings.pinChanged'), 'success');
+        return true;
+      }
+    });
+  }
+
+  function openSetPinDialog() {
+    return UI.formDialog({
+      title: t('settings.setPin'),
+      submitLabel: t('settings.setPin'),
+      body:
+        '<label class="field"><span>' + esc(t('settings.newPin')) + '</span>' +
+          '<input class="input pin-input" name="newPin" type="password" inputmode="numeric" maxlength="6" autocomplete="new-password" required></label>' +
+        '<label class="field"><span>' + esc(t('settings.confirmPin')) + '</span>' +
+          '<input class="input pin-input" name="confirmPin" type="password" inputmode="numeric" maxlength="6" autocomplete="new-password" required></label>' +
+        '<p class="hint hint-warn">' + esc(t('settings.pinWarning')) + '</p>',
+      onSubmit: async function (fd) {
+        if (!Pin.isSupported()) throw userError(t('gate.cryptoUnavailable'));
+        var next = String(fd.get('newPin') || '');
+        var confirm = String(fd.get('confirmPin') || '');
+        if (!Pin.isValid(next)) throw userError(t('validation.pinLength'));
+        if (Pin.normalize(next) !== Pin.normalize(confirm)) throw userError(t('validation.pinMismatch'));
+        var record = await Pin.create(next);
+        App.settings = await DB.updateSettings(record);
+        UI.toast(t('settings.pinSet'), 'success');
+        App.rerender();
+        return true;
+      }
+    });
+  }
+
+  function openRemovePinDialog() {
+    return UI.formDialog({
+      title: t('settings.removePin'),
+      submitLabel: t('settings.removePin'),
+      danger: true,
+      body:
+        '<label class="field"><span>' + esc(t('settings.currentPin')) + '</span>' +
+          '<input class="input pin-input" name="currentPin" type="password" inputmode="numeric" maxlength="6" autocomplete="current-password" required></label>' +
+        '<p class="hint">' + esc(t('settings.removePinHint')) + '</p>',
+      onSubmit: async function (fd) {
+        if (!Pin.isSupported()) throw userError(t('gate.cryptoUnavailable'));
+        var current = String(fd.get('currentPin') || '');
+        var ok = await Pin.verify(current, App.settings);
+        if (!ok) throw userError(t('gate.wrongPin'));
+        var next = Object.assign({}, await DB.getSettings());
+        delete next.pinHash;
+        delete next.pinSalt;
+        delete next.pinIterations;
+        delete next.pinVersion;
+        App.settings = await DB.saveSettings(next);
+        App.attempts = 0;
+        App.lockUntil = 0;
+        try { localStorage.removeItem(LOCK_KEY); } catch (_) {}
+        UI.toast(t('settings.pinRemoved'), 'success');
+        App.rerender();
         return true;
       }
     });
@@ -1384,23 +1552,52 @@
       confirmLabel: t('settings.deleteForever')
     });
     if (!confirmed) return;
+    var user = window.Auth ? Auth.user() : null;
+    var apiConfigured = !!(window.Api && Api.isConfigured());
+    var remoteDeleted = false;
+    var revisionInfo = null;
+    if (apiConfigured && window.Sync && user) {
+      if (!window.Auth || !Auth.valid()) {
+        showLogin('auth.sessionExpired');
+        return;
+      }
+      if (!navigator.onLine) {
+        UI.alert({ title: t('settings.deleteAll'), message: t('settings.deleteNeedsConnection') });
+        return;
+      }
+      try {
+        revisionInfo = await Sync.deleteAll();
+        remoteDeleted = true;
+      } catch (err) {
+        showCloudError(err);
+        return;
+      }
+    }
     if (window.Sync && Sync.reset) Sync.reset();
     try {
       await DB.clearAllData();
+      if (user) {
+        App.settings = await DB.ensureSettings(user);
+        if (window.Sync) {
+          await Sync.init();
+          if (remoteDeleted) await Sync.markClean(revisionInfo.revision, revisionInfo.updatedAt);
+        }
+      }
     } catch (err) {
       console.error(err);
       UI.toast(t('error.generic'), 'error');
       return;
     }
     try { localStorage.removeItem(LOCK_KEY); } catch (_) {}
-    App.settings = null;
     App.data = null;
     App.billing = null;
     App.unlocked = false;
+    App.skipSyncOnce = !remoteDeleted;
     closeDialogs();
-    I18n.setLanguage('fa');
-    UI.applyTheme('auto');
-    showSetup('fa');
+    UI.applyTheme(App.settings && App.settings.theme ? App.settings.theme : 'auto');
+    UI.toast(t('settings.dataDeleted'), 'success');
+    if (user) enterApp();
+    else showLogin();
   }
 
   async function updateDataSize(view) {
@@ -1464,11 +1661,21 @@
       updateNetBanner();
       if (App.wasOffline) UI.toast(t('toast.online'), 'success');
       App.wasOffline = false;
+      if (App.staleAuth) {
+        if (window.Auth) Auth.clear();
+        showLogin('auth.sessionExpired');
+      }
     });
     window.addEventListener('offline', function () {
       App.wasOffline = true;
       updateNetBanner();
       UI.toast(t('toast.offline'), 'info');
+    });
+    window.addEventListener('my-class-auth-expired', function () {
+      if (App.unlocked) {
+        if (window.Auth) Auth.clear();
+        showLogin('auth.sessionExpired');
+      }
     });
     window.addEventListener('beforeinstallprompt', function (e) {
       e.preventDefault();
