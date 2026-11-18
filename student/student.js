@@ -5,6 +5,7 @@
     lang: 'my-class-student-lang',
     theme: 'my-class-student-theme',
     session: 'my-class-student-session-v2',
+    sessionStandby: 'my-class-student-session-v2:standby',
     cache: 'my-class-student-cache-v2',
     legacy: [
       'my-class-student-files-v1',
@@ -42,6 +43,7 @@
 
   var state = {
     session: null,
+    backend: 'primary',
     portal: null,
     busy: false,
     offline: !navigator.onLine,
@@ -121,6 +123,56 @@
       Number(session.expiresAtMs) > Date.now() + SESSION_SKEW_MS);
   }
 
+  function activeBackend() {
+    if (window.Api && typeof Api.activeBackend === 'function' && Api.activeBackend() === 'standby') return 'standby';
+    return 'primary';
+  }
+
+  function sessionKey(backend) {
+    return backend === 'standby' ? LS.sessionStandby : LS.session;
+  }
+
+  function readSession(backend) {
+    var session = read(sessionKey(backend), null);
+    return isSessionValid(session) ? session : null;
+  }
+
+  function sessionTokens() {
+    var primary = readSession('primary');
+    var standby = readSession('standby');
+    return {
+      primary: primary ? primary.token : '',
+      standby: standby ? standby.token : ''
+    };
+  }
+
+  function readOnlyBackend() {
+    return activeBackend() === 'standby';
+  }
+
+  function apiCall(action, payload, options) {
+    var opts = Object.assign({}, options || {});
+    var tokens = sessionTokens();
+    opts.tokens = tokens;
+    if (!opts.forcePrimary) {
+      if (!tokens.primary && tokens.standby) opts.backend = 'standby';
+      else if (tokens.primary && !tokens.standby) opts.backend = 'primary';
+    }
+    var original = opts.onBackend;
+    opts.onBackend = function (backend) {
+      state.backend = backend;
+      var stored = readSession(backend);
+      if (stored) {
+        state.session = stored;
+        saveSession();
+      }
+      if (typeof original === 'function') {
+        try { original(backend); } catch (_) {}
+      }
+    };
+    return Api.call(action, payload || {}, opts);
+  }
+
   function validPortal(portal, studentId) {
     return !!(portal &&
       portal.app === 'my-class-portal' &&
@@ -153,6 +205,7 @@
     if (code === 'INVALID_IMAGE') return t('sp.imageInvalid');
     if (code === 'IMAGE_TOO_LARGE') return t('sp.imageTooLarge');
     if (code === 'INVALID_PORTAL' || code === 'DATA_CORRUPT') return t('sp.portalLoadError');
+    if (code === 'READ_ONLY') return t('backup.readOnly');
     if (code === 'sp.imageTooLarge' || code === 'sp.imageInvalid' || code === 'sp.imageReadError') return err.message;
     if (code === 'NETWORK_ERROR' || code === 'TIMEOUT' || code === 'HTTP_ERROR' || code === 'BAD_RESPONSE') return t('sp.connectionLost');
     if (!navigator.onLine) return t('sp.offlineNotice');
@@ -161,10 +214,10 @@
 
   function saveSession() {
     if (!state.session) {
-      remove(LS.session);
+      remove(sessionKey(state.backend));
       return;
     }
-    write(LS.session, {
+    write(sessionKey(state.backend), {
       token: state.session.token,
       expiresAt: state.session.expiresAt,
       expiresAtMs: state.session.expiresAtMs,
@@ -190,11 +243,16 @@
     state.lastSync = cache.lastSync || '';
   }
 
-  function clearAuth(message) {
+  function clearAuth(message, all) {
+    if (all) {
+      remove(LS.session);
+      remove(LS.sessionStandby);
+    } else {
+      remove(sessionKey(state.backend));
+    }
     state.session = null;
     state.portal = null;
     state.lastSync = '';
-    remove(LS.session);
     remove(LS.cache);
     state.error = message || '';
   }
@@ -229,6 +287,33 @@
 
   function setError(message) {
     state.error = message || '';
+  }
+
+  function backupBannerHtml() {
+    if (!readOnlyBackend()) return '';
+    return '<div class="sp-banner is-warn">' + icon('cloud', 16) +
+      '<span>' + esc(t('backup.readOnly')) +
+      ' <button type="button" class="sp-btn" data-action="retry-primary">' + esc(t('backup.retry')) + '</button></span></div>';
+  }
+
+  function retryPrimary() {
+    if (!window.Api || !Api.retryPrimary || state.busy) return;
+    state.busy = true;
+    render();
+    Api.retryPrimary().then(function () {
+      state.busy = false;
+      state.backend = 'primary';
+      var stored = readSession('primary');
+      if (stored) state.session = stored;
+      setError('');
+      toast(t('backup.primaryRestored'), 'success');
+      render();
+      if (state.session) refresh({ silent: true });
+    }).catch(function () {
+      state.busy = false;
+      toast(t('backup.primaryUnavailable'), 'error');
+      render();
+    });
   }
 
   function statusBadge(balance) {
@@ -295,6 +380,7 @@
         '<div class="sp-auth-mark">' + icon('book', 32) + '</div>' +
         '<h1>' + esc(t('sp.title')) + '</h1>' +
         '<p>' + esc(t('sp.signInHint')) + '</p>' +
+        backupBannerHtml() +
         (state.error ? '<div class="sp-banner is-error">' + esc(state.error) + '</div>' : '') +
         (!configured ? '<div class="sp-banner is-warn">' + esc(t('sp.notConfigured')) + '<br>' + esc(t('sp.configHint')) + '</div>' : '') +
         '<form class="sp-form sp-auth-form" data-login-form novalidate>' +
@@ -312,6 +398,7 @@
   function appHtml() {
     var offline = state.offline;
     var banners = (offline ? '<div class="sp-banner is-warn">' + icon('cloud', 16) + ' ' + esc(t('sp.offlineNotice')) + '</div>' : '') +
+      (!offline ? backupBannerHtml() : '') +
       (state.busy ? '<div class="sp-banner">' + icon('refresh', 16) + ' ' + esc(t('sp.homeLoading')) + '</div>' : '') +
       (state.error ? '<div class="sp-banner is-error">' + icon('alert', 16) + '<span>' + esc(state.error) + ' <button type="button" class="sp-btn" style="margin-top:6px" data-action="refresh">' + esc(t('sp.tryAgain')) + '</button></span></div>' : '');
     if (!state.portal) {
@@ -524,21 +611,24 @@
 
   function proofsHtml() {
     var proofs = state.portal.proofs || [];
+    var readOnly = readOnlyBackend();
+    var off = readOnly || state.busy ? ' disabled' : '';
     return '<section class="sp-card">' +
       '<div class="sp-section-head"><h2>' + esc(t('sp.submitProof')) + '</h2></div>' +
       '<p class="sp-sub">' + esc(t('sp.submitProofHint')) + '</p>' +
+      (readOnly ? backupBannerHtml() : '') +
       (state.offline ? '<div class="sp-banner is-warn">' + icon('cloud', 16) + ' ' + esc(t('sp.offlineSubmit')) + '</div>' : '') +
       '<form class="sp-form" data-proof-form novalidate>' +
         '<label class="sp-field"><span>' + esc(t('sp.amount')) + '</span>' +
-          '<input class="sp-input" name="amount" inputmode="numeric" dir="ltr" autocomplete="off" placeholder="' + esc(t('sp.amount')) + '"></label>' +
-        '<div class="sp-field"><span>' + esc(t('sp.date')) + '</span>' + dateFieldHtml(Jalali.todayISO()) + '</div>' +
+          '<input class="sp-input" name="amount" inputmode="numeric" dir="ltr" autocomplete="off" placeholder="' + esc(t('sp.amount')) + '"' + off + '></label>' +
+        '<div class="sp-field"><span>' + esc(t('sp.date')) + '</span><div data-date-wrap>' + dateFieldHtml(Jalali.todayISO()) + '</div></div>' +
         '<label class="sp-field"><span>' + esc(t('sp.note')) + '</span>' +
-          '<textarea class="sp-textarea" name="note" maxlength="500" placeholder="' + esc(t('sp.notePlaceholder')) + '"></textarea></label>' +
+          '<textarea class="sp-textarea" name="note" maxlength="500" placeholder="' + esc(t('sp.notePlaceholder')) + '"' + off + '></textarea></label>' +
         '<div class="sp-field"><span>' + esc(t('sp.image')) + '</span>' +
-          '<div class="sp-file"><input type="file" name="image" accept="image/jpeg,image/png,image/webp" data-proof-file>' +
+          '<div class="sp-file"><input type="file" name="image" accept="image/jpeg,image/png,image/webp" data-proof-file' + off + '>' +
           '<div class="sp-preview" data-proof-preview></div></div></div>' +
         '<p class="sp-form-error" data-proof-error hidden></p>' +
-        '<button type="submit" class="sp-btn is-primary sp-btn-block"' + (state.busy ? ' disabled' : '') + '>' + icon('upload') + ' ' + esc(state.busy ? t('sp.submitting') : t('sp.submit')) + '</button>' +
+        '<button type="submit" class="sp-btn is-primary sp-btn-block"' + (readOnly || state.busy ? ' disabled' : '') + '>' + icon('upload') + ' ' + esc(state.busy ? t('sp.submitting') : t('sp.submit')) + '</button>' +
       '</form>' +
     '</section>' +
     '<section class="sp-card">' +
@@ -697,7 +787,7 @@
 
   function fetchPortal() {
     if (!state.session) return Promise.reject(makeError('AUTH_REQUIRED', t('sp.authRequired')));
-    return Api.call('studentGetPortal', { token: state.session.token }, { timeout: 30000 }).then(function (data) {
+    return apiCall('studentGetPortal', {}, { timeout: 20000 }).then(function (data) {
       var studentId = state.session.user.studentId;
       if (!data || !validPortal(data.portal, studentId)) {
         throw makeError('INVALID_PORTAL', t('sp.portalLoadError'));
@@ -732,13 +822,18 @@
     state.busy = true;
     setError('');
     render();
-    Api.call('authLogin', { username: username, password: password }, { timeout: 20000 }).then(function (data) {
+    var used = 'primary';
+    Api.call('authLogin', { username: username, password: password }, {
+      timeout: 20000,
+      onBackend: function (backend) { used = backend; }
+    }).then(function (data) {
       if (!data || !data.token || !data.user || data.user.role !== 'student') {
         if (data && data.token) {
-          Api.call('authLogout', { token: data.token }, { timeout: 8000 }).catch(function () {});
+          Api.call('authLogout', { token: data.token }, { timeout: 8000, backend: used }).catch(function () {});
         }
         throw makeError('STUDENT_ONLY', t('sp.studentOnly'));
       }
+      state.backend = used;
       state.session = {
         token: data.token,
         expiresAt: data.expiresAt || '',
@@ -804,6 +899,10 @@
       render();
       return;
     }
+    if (readOnlyBackend()) {
+      showFormError(form, t('backup.readOnly'));
+      return;
+    }
     if (!navigator.onLine) {
       showFormError(form, t('sp.offlineSubmit'));
       return;
@@ -835,15 +934,14 @@
     var uploaded = false;
     try {
       var compressed = await compressImage(file, MAX_PROOF_BYTES);
-      await Api.call('studentSubmitReceipt', {
-        token: state.session.token,
+      await apiCall('studentSubmitReceipt', {
         amount: amount,
         date: iso,
         note: note,
         mime: compressed.mime,
         fileName: compressed.fileName,
         data: compressed.data
-      }, { timeout: PROOF_TIMEOUT_MS });
+      }, { timeout: PROOF_TIMEOUT_MS, forcePrimary: true });
       uploaded = true;
       var portalError = '';
       try {
@@ -874,13 +972,23 @@
   }
 
   function signOut() {
-    var session = state.session;
-    clearAuth('');
+    var sessions = [
+      { backend: 'primary', session: readSession('primary') },
+      { backend: 'standby', session: readSession('standby') }
+    ];
+    if (state.session && state.backend) sessions.push({ backend: state.backend, session: state.session });
+    clearAuth('', true);
     state.busy = false;
     state.loginName = '';
     render();
-    if (session && navigator.onLine) {
-      Api.call('authLogout', { token: session.token }, { timeout: 8000 }).catch(function () {});
+    if (navigator.onLine) {
+      sessions.forEach(function (item) {
+        if (!item.session || !item.session.token) return;
+        Api.call('authLogout', { token: item.session.token }, {
+          timeout: 8000,
+          backend: item.backend
+        }).catch(function () {});
+      });
     }
     toast(t('sp.signedOut'), 'success');
   }
@@ -896,6 +1004,9 @@
     if (form) {
       bindDateField(form);
       bindProofFile(form);
+      if (readOnlyBackend()) {
+        form.querySelectorAll('input, select, textarea, button').forEach(function (field) { field.disabled = true; });
+      }
     }
   }
 
@@ -926,6 +1037,8 @@
         render();
       } else if (action === 'refresh') {
         refresh({ notify: true });
+      } else if (action === 'retry-primary') {
+        retryPrimary();
       } else if (action === 'signout') {
         signOut();
       }
@@ -962,6 +1075,13 @@
       state.offline = true;
       render();
     });
+
+    window.addEventListener('my-class-backend-changed', function () {
+      state.backend = activeBackend();
+      var stored = readSession(state.backend);
+      if (stored) state.session = stored;
+      render();
+    });
   }
 
   function registerSW() {
@@ -978,12 +1098,19 @@
     document.title = t('sp.title');
     applyTheme(read(LS.theme, 'auto'));
     LS.legacy.forEach(remove);
-    var session = read(LS.session, null);
-    if (isSessionValid(session)) {
+    state.backend = activeBackend();
+    var session = readSession(state.backend);
+    if (!session) {
+      var other = state.backend === 'primary' ? 'standby' : 'primary';
+      session = readSession(other);
+      if (session) state.backend = other;
+    }
+    if (session) {
       state.session = session;
       restoreCache();
     } else {
-      if (session) remove(LS.session);
+      remove(LS.session);
+      remove(LS.sessionStandby);
       remove(LS.cache);
     }
     state.tab = currentTab();

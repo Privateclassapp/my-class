@@ -3,7 +3,7 @@
   'use strict';
 
   var Pages = window.Pages = window.Pages || {};
-  var APP_VERSION = '2.0.0';
+  var APP_VERSION = '2.1.0';
   var LOCK_KEY = 'my-class-lock-until';
   var LANG_KEY = 'my-class-language-v2';
   var LEGACY_CLAIM_KEY = 'my-class-legacy-claim-v2';
@@ -907,6 +907,8 @@
     }
     var cloudError = (sync && (sync.lastError || (sync.meta && sync.meta.lastError))) || '';
     var cloudAuto = !!(sync && sync.meta && sync.meta.autoSync);
+    var backendStatus = window.Api && Api.status ? Api.status() : { active: 'primary' };
+    var backupActive = backendStatus.active === 'standby';
     var accountName = authUser ? (authUser.displayName || authUser.username) : '';
     var accountRole = authUser ? t(authUser.role === 'owner' ? 'auth.roleOwner' : 'auth.roleTeacher') : '';
     var pinEnabled = !!settings.pinHash;
@@ -946,6 +948,8 @@
             '<p class="hint">' + esc(t('auth.accountRole', { role: accountRole })) + '</p>' : '') +
           (!cloudConfigured ? '<p class="hint hint-warn">' + esc(t('cloud.notConfigured')) + '</p>' + '<p class="hint">' + esc(t('cloud.setupHint')) + '</p>' : '') +
           (cloudExpired ? '<p class="hint hint-warn">' + esc(t('auth.sessionExpired')) + '</p>' : '') +
+          (backupActive ? '<p class="hint hint-warn">' + esc(t('backup.readOnly')) + '</p>' +
+            '<div class="settings-actions"><button type="button" class="btn ghost" data-retry-primary>' + UI.icon('refresh', 17) + ' ' + esc(t('backup.retry')) + '</button></div>' : '') +
           (sync && !sync.online ? '<p class="hint hint-warn">' + esc(t('auth.offline')) + '</p>' : '') +
           (cloudAuthenticated && cloudInitialized
             ? '<p class="hint">' + esc(t('cloud.lastSync', { date: cloudLastSync })) + '</p>' +
@@ -1182,6 +1186,7 @@
     if (err.code === 'AUTH_REQUIRED' || err.code === 'AUTH_EXPIRED' || err.code === 'ACCOUNT_DISABLED') return 'cloud.authRequired';
     if (err.code === 'OFFLINE' || err.code === 'NETWORK_ERROR' || err.code === 'TIMEOUT') return 'auth.offline';
     if (err.code === 'SYNC_CONFLICT') return 'cloud.conflict';
+    if (err.code === 'READ_ONLY') return 'backup.readOnly';
     return 'cloud.error';
   }
 
@@ -1641,14 +1646,46 @@
     var banner = document.getElementById('netBanner');
     if (!banner) return;
     var online = navigator.onLine;
+    var backup = !!(window.Api && Api.activeBackend && Api.activeBackend() === 'standby');
     if (!online) {
       banner.hidden = false;
       banner.textContent = t('toast.offline');
       banner.classList.add('show');
-    } else {
+      return;
+    }
+    if (!backup) {
       banner.classList.remove('show');
       banner.hidden = true;
+      banner.textContent = '';
+      return;
     }
+    banner.hidden = false;
+    banner.classList.add('show');
+    banner.textContent = '';
+    var label = document.createElement('span');
+    label.textContent = t('backup.readOnly') + ' ';
+    var retry = document.createElement('button');
+    retry.type = 'button';
+    retry.className = 'net-banner-btn';
+    retry.setAttribute('data-retry-primary', '');
+    retry.textContent = t('backup.retry');
+    banner.appendChild(label);
+    banner.appendChild(retry);
+  }
+
+  function retryPrimaryServer() {
+    if (!window.Api || !Api.retryPrimary) return Promise.resolve();
+    var buttons = document.querySelectorAll('[data-retry-primary]');
+    buttons.forEach(function (button) { button.disabled = true; });
+    return Api.retryPrimary().then(function () {
+      updateNetBanner();
+      if (App.unlocked) App.rerender();
+      UI.toast(t('backup.primaryRestored'), 'success');
+    }).catch(function () {
+      updateNetBanner();
+      if (App.unlocked) App.rerender();
+      UI.toast(t('backup.primaryUnavailable'), 'error');
+    });
   }
 
   function bindGlobalEvents() {
@@ -1676,6 +1713,16 @@
         if (window.Auth) Auth.clear();
         showLogin('auth.sessionExpired');
       }
+    });
+    window.addEventListener('my-class-backend-changed', function () {
+      updateNetBanner();
+      if (App.unlocked) App.rerender();
+    });
+    document.addEventListener('click', function (event) {
+      var retry = event.target.closest && event.target.closest('[data-retry-primary]');
+      if (!retry) return;
+      event.preventDefault();
+      retryPrimaryServer();
     });
     window.addEventListener('beforeinstallprompt', function (e) {
       e.preventDefault();

@@ -334,6 +334,17 @@ svg {
   text-align: center;
 }
 
+.net-banner-btn {
+  margin-inline-start: 6px;
+  padding: 2px 8px;
+  border: 1px solid currentColor;
+  border-radius: 999px;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+}
+
 .noscript {
   position: fixed;
   inset: 0;

@@ -642,6 +642,11 @@
       'toast.updateReady': 'نسخه جدید برنامه آماده است. برای به‌روزرسانی، برنامه را ببندید و دوباره باز کنید.',
       'toast.locked': 'برنامه قفل شد.',
 
+      'backup.readOnly': 'سرور پشتیبان — فقط خواندنی. داده‌ها ممکن است تا یک روز قدیمی باشند.',
+      'backup.retry': 'تلاش دوباره برای سرور اصلی',
+      'backup.primaryRestored': 'سرور اصلی دوباره در دسترس است.',
+      'backup.primaryUnavailable': 'سرور اصلی هنوز در دسترس نیست.',
+
       'cloud.title': 'همگام‌سازی سرور',
       'cloud.subtitle': 'داده‌ها با حساب معلم روی سرور برنامه ذخیره می‌شوند.',
       'cloud.notConfigured': 'آدرس سرور هنوز در config.js تنظیم نشده است.',
@@ -1784,6 +1789,11 @@
       'toast.online': 'You are online again.',
       'toast.updateReady': 'A new version is ready. Close and reopen the app to update.',
       'toast.locked': 'App locked.',
+
+      'backup.readOnly': 'Backup server, read-only. Data may be up to a day old.',
+      'backup.retry': 'Retry main server',
+      'backup.primaryRestored': 'The main server is available again.',
+      'backup.primaryUnavailable': 'The main server is still unavailable.',
 
       'cloud.title': 'Server sync',
       'cloud.subtitle': 'Your data is stored with your teacher account on the app server.',

@@ -86,7 +86,7 @@
   }
 
   function call(action, payload) {
-    return root.Auth.call(action, payload || {}, { timeout: 60000 });
+    return root.Auth.call(action, payload || {}, { timeout: 60000, forcePrimary: true });
   }
 
   function reportError(err) {

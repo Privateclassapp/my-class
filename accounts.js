@@ -20,7 +20,7 @@
     return !!(window.Auth && Auth.valid());
   }
   function apiCall(action, payload) {
-    return Auth.call(action, payload, { timeout: 45000 });
+    return Auth.call(action, payload, { timeout: 45000, forcePrimary: true });
   }
   function userError(message) {
     var err = new Error(message);

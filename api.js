@@ -7,7 +7,16 @@
 })(typeof globalThis !== 'undefined' ? globalThis : this, function (root) {
   'use strict';
 
-  var DEFAULT_TIMEOUT = 30000;
+  var DEFAULT_TIMEOUT = 20000;
+  var FAILURE_LIMIT = 2;
+  var FAILURE_WINDOW = 5 * 60 * 1000;
+  var BREAKER_MS = 5 * 60 * 1000;
+  var state = {
+    active: 'primary',
+    failures: [],
+    openUntil: 0,
+    lastError: ''
+  };
 
   function makeError(code, message, extra) {
     var err = new Error(message || code);
@@ -19,9 +28,29 @@
     return err;
   }
 
+  function config() {
+    return root.APP_CONFIG || {};
+  }
+
+  function cleanUrl(value) {
+    return String(value || '').trim().replace(/\/+$/, '');
+  }
+
+  function urlFor(backend) {
+    var cfg = config();
+    return cleanUrl(backend === 'standby' ? cfg.fallbackUrl : cfg.backendUrl);
+  }
+
   function configuredUrl() {
-    var config = root.APP_CONFIG || {};
-    return String(config.backendUrl || '').trim().replace(/\/+$/, '');
+    return urlFor('primary');
+  }
+
+  function fallbackUrl() {
+    return urlFor('standby');
+  }
+
+  function hasFallback() {
+    return !!fallbackUrl();
   }
 
   function parseEnvelope(text, status) {
@@ -47,15 +76,66 @@
     return payload.data;
   }
 
-  function call(action, payload, options) {
-    var opts = options || {};
-    var url = configuredUrl();
+  function isInfrastructure(err) {
+    if (!err) return false;
+    var statusCode = Number(err.status) || 0;
+    if (statusCode >= 500 || statusCode === 429) return true;
+    if (['NETWORK_ERROR', 'TIMEOUT', 'BAD_RESPONSE'].indexOf(err.code) >= 0) return true;
+    return err.code === 'HTTP_ERROR' && statusCode === 0;
+  }
+
+  function emitBackendChange() {
+    if (!root.dispatchEvent || typeof root.CustomEvent !== 'function') return;
+    try {
+      root.dispatchEvent(new root.CustomEvent('my-class-backend-changed', { detail: status() }));
+    } catch (_) {}
+  }
+
+  function setActive(backend) {
+    if (state.active === backend) return;
+    state.active = backend;
+    emitBackendChange();
+  }
+
+  function recordSuccess(backend) {
+    if (backend !== 'primary') return;
+    state.failures = [];
+    state.openUntil = 0;
+    state.lastError = '';
+    setActive('primary');
+  }
+
+  function recordFailure(backend, err) {
+    if (backend !== 'primary') return;
+    var now = Date.now();
+    state.lastError = err && err.message ? err.message : 'Main server unavailable.';
+    state.failures = state.failures.filter(function (at) { return now - at <= FAILURE_WINDOW; });
+    state.failures.push(now);
+    if (state.failures.length >= FAILURE_LIMIT) {
+      state.openUntil = now + BREAKER_MS;
+      state.failures = [now];
+    }
+  }
+
+  function chooseBackend(opts) {
+    if (opts.backend === 'primary' || opts.backend === 'standby') return opts.backend;
+    if (opts.forcePrimary || !hasFallback()) return 'primary';
+    if (state.active === 'standby' && state.openUntil > Date.now()) return 'standby';
+    return 'primary';
+  }
+
+  function callBackend(backend, action, payload, opts) {
+    var url = urlFor(backend);
     if (!url) return Promise.reject(makeError('NOT_CONFIGURED', 'The backend URL is not configured.'));
-    if (!action || typeof action !== 'string') return Promise.reject(makeError('INVALID_ACTION', 'Invalid action.'));
     var fetchImpl = opts.fetchImpl || root.fetch;
     if (typeof fetchImpl !== 'function') return Promise.reject(makeError('NETWORK_ERROR', 'Network access is unavailable.'));
 
     var body = Object.assign({ action: action }, payload || {});
+    if (opts.tokens) {
+      delete body.token;
+      var token = opts.tokens[backend];
+      if (token) body.token = token;
+    }
     var timeout = Number(opts.timeout) > 0 ? Number(opts.timeout) : DEFAULT_TIMEOUT;
     var controller = null;
     var timer = null;
@@ -80,17 +160,17 @@
       if (!response || typeof response.text !== 'function') {
         throw makeError('BAD_RESPONSE', 'The server returned an invalid response.');
       }
-      var status = Number(response.status) || 0;
+      var statusCode = Number(response.status) || 0;
       return response.text().then(function (text) {
         if (!response.ok) {
           try {
-            return parseEnvelope(text, status);
+            return parseEnvelope(text, statusCode);
           } catch (err) {
             if (err && err.code && err.code !== 'BAD_RESPONSE') throw err;
-            throw makeError('HTTP_ERROR', 'The server request failed.', { status: status });
+            throw makeError('HTTP_ERROR', 'The server request failed.', { status: statusCode });
           }
         }
-        return parseEnvelope(text, status);
+        return parseEnvelope(text, statusCode);
       });
     }).catch(function (err) {
       if (err && err.code) throw err;
@@ -105,9 +185,70 @@
     });
   }
 
+  function announce(opts, backend) {
+    if (typeof opts.onBackend !== 'function') return;
+    try { opts.onBackend(backend); } catch (_) {}
+  }
+
+  function call(action, payload, options) {
+    var opts = Object.assign({}, options || {});
+    if (!action || typeof action !== 'string') return Promise.reject(makeError('INVALID_ACTION', 'Invalid action.'));
+    var backend = chooseBackend(opts);
+    if (!urlFor(backend)) return Promise.reject(makeError('NOT_CONFIGURED', 'The backend URL is not configured.'));
+    announce(opts, backend);
+
+    return callBackend(backend, action, payload, opts).then(function (data) {
+      recordSuccess(backend);
+      return data;
+    }, function (err) {
+      if (backend !== 'primary' || opts.backend === 'standby') throw err;
+      var infrastructure = isInfrastructure(err);
+      var wasStandby = state.active === 'standby';
+      if (infrastructure) recordFailure('primary', err);
+      if (!infrastructure || opts.backend === 'primary' || opts.forcePrimary || !hasFallback() ||
+          (!wasStandby && state.openUntil <= Date.now())) {
+        throw err;
+      }
+      announce(opts, 'standby');
+      return callBackend('standby', action, payload, opts).then(function (data) {
+        setActive('standby');
+        return data;
+      });
+    });
+  }
+
+  function retryPrimary(options) {
+    var opts = Object.assign({}, options || {}, { forcePrimary: true });
+    return call('health', {}, opts);
+  }
+
+  function status() {
+    var now = Date.now();
+    return {
+      active: state.active,
+      configured: !!configuredUrl(),
+      fallbackConfigured: !!fallbackUrl(),
+      primaryDown: state.openUntil > now,
+      retryInMs: Math.max(0, state.openUntil - now),
+      lastError: state.lastError
+    };
+  }
+
+  function reset() {
+    state.active = 'primary';
+    state.failures = [];
+    state.openUntil = 0;
+    state.lastError = '';
+  }
+
   return {
     call: call,
+    retryPrimary: retryPrimary,
+    status: status,
+    reset: reset,
     baseUrl: configuredUrl,
+    fallbackUrl: fallbackUrl,
+    activeBackend: function () { return state.active; },
     isConfigured: function () { return !!configuredUrl(); }
   };
 });

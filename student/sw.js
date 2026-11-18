@@ -1,4 +1,4 @@
-const VERSION = 'my-class-student-v2.0.0';
+const VERSION = 'my-class-student-v2.1.0';
 const CACHE_NAME = VERSION;
 const APP_SHELL = [
   './',

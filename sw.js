@@ -1,5 +1,5 @@
 /* sw.js — offline cache for the app shell. */
-const VERSION = 'my-class-v2.0.0';
+const VERSION = 'my-class-v2.1.0';
 const CACHE_NAME = VERSION;
 const APP_SHELL = [
   './',
